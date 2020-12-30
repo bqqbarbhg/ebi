@@ -647,7 +647,6 @@ bool ebi_gc_sweep(ebi_thread *et)
 		if (obj->epoch != bad_epoch) {
 			ebi_add_obj(et, obj);
 		} else {
-			printf("FREE: %p\n", obj + 1);
 			free(obj);
 		}
 	}
