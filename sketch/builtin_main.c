@@ -36,7 +36,7 @@ int main(int argc, char **argv)
 	root[0]->left = ebi_new(et, *pt_pair, 1);
 	root[0]->right = root[0];
 
-	// ebi_pop_check(et, root);
+	ebi_pop_check(et, root);
 
 	printf("pt_pair: %p\n", pt_pair);
 	printf("*pt_pair: %p\n", *pt_pair);
