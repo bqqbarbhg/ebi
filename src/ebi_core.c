@@ -312,7 +312,7 @@ void ebi_mark_globals(ebi_thread *et)
 
 	// Types
 	size_t num_types = sizeof(ebi_types) / sizeof(ebi_type*);
-	ebi_mark_slots(et, &vm->types, vm->types.ptr_type, num_types);
+	ebi_mark_slots(et, &vm->types, vm->types.object, num_types);
 }
 
 void *ebi_callstack_push(ebi_callstack *stack, ebi_type *type, size_t count)
@@ -423,10 +423,10 @@ ebi_vm *ebi_make_vm()
 	}
 
 	{
-		ebi_type *t = vm->types.ptr_type;
+		ebi_type *t = vm->types.object;
 		const uint32_t slots[] = { 0 };
-		t->name = ebi_new_stringz(et, "ref ebi.Type");
-		t->size = sizeof(ebi_type*);
+		t->name = ebi_new_stringz(et, "Object");
+		t->size = sizeof(void*);
 		t->slots = ebi_new_copy(et, vm->types.u32, ebi_arraycount(slots), slots);
 	}
 
@@ -647,6 +647,7 @@ bool ebi_gc_sweep(ebi_thread *et)
 		if (obj->epoch != bad_epoch) {
 			ebi_add_obj(et, obj);
 		} else {
+			printf("FREE: %p\n", obj + 1);
 			free(obj);
 		}
 	}

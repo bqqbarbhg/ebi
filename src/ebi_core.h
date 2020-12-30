@@ -33,7 +33,7 @@ struct ebi_types {
 	ebi_type *char_;
 	ebi_type *u32;
 	ebi_type *string;
-	ebi_type *ptr_type;
+	ebi_type *object;
 	ebi_type *type_desc;
 };
 

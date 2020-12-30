@@ -17,7 +17,7 @@ int main(int argc, char **argv)
 
 	ebi_lock_thread(et);
 
-	ebi_type **pt_pair = ebi_push(et, ts->ptr_type, 1);
+	ebi_type **pt_pair = ebi_push(et, ts->object, 1);
 
 	ebi_type_desc *desc = ebi_push(et, ts->type_desc, 1);
 	desc->size = sizeof(pair_t);
@@ -30,17 +30,19 @@ int main(int argc, char **argv)
 
 	ebi_pop_check(et, desc);
 
-	pair_t *root = ebi_push(et, *pt_pair, 1);
+	pair_t **root = ebi_push(et, ts->object, 1);
 
-	root->left = ebi_new(et, *pt_pair, 1);
-	root->right = ebi_new(et, *pt_pair, 1);
-	root->right = ebi_new(et, *pt_pair, 1);
+	root[0] = ebi_new(et, *pt_pair, 1);
+	root[0]->left = ebi_new(et, *pt_pair, 1);
+	root[0]->right = root[0];
+
+	// ebi_pop_check(et, root);
 
 	printf("pt_pair: %p\n", pt_pair);
 	printf("*pt_pair: %p\n", *pt_pair);
-	printf("root: %p\n", root);
-	printf("root->left: %p\n", root->left);
-	printf("root->right: %p\n", root->right);
+	printf("root: %p\n", root[0]);
+	printf("root->left: %p\n", root[0]->left);
+	printf("root->right: %p\n", root[0]->right);
 
 	for (uint32_t i = 0; i < 20; i++) {
 		ebi_gc_step(et);
