@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?> 
 <AutoVisualizer xmlns="http://schemas.microsoft.com/vstudio/debugger/natvis/2010">
   <Type Name="ebi_string">
-    <DisplayString>{ data+begin,[end-begin]s }</DisplayString>
+    <DisplayString>{ (char*)data+begin,[length]s }</DisplayString>
+  </Type>
+  <Type Name="ebi_type">
+    <DisplayString>{ name }</DisplayString>
   </Type>
 </AutoVisualizer>
