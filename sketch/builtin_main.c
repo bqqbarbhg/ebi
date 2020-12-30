@@ -1,5 +1,7 @@
 #include "../src/ebi_core.h"
 
+#include <stdio.h>
+
 typedef struct pair_t pair_t;
 struct pair_t {
 
