@@ -10,8 +10,6 @@
 
 // Platform
 
-#define ebi_forceinline __forceinline
-
 // Intrinsics
 
 bool ebi_dcas(uintptr_t *dst, uintptr_t *cmp, uintptr_t lo, uintptr_t hi)
@@ -114,6 +112,13 @@ void ebi_mutex_unlock(ebi_mutex *m)
 	}
 }
 
+// Utility
+
+static ebi_forceinline size_t ebi_grow_sz(size_t size, size_t min)
+{
+	size = size > min ? size * 2 : min;
+}
+
 // -- Core
 
 typedef struct ebi_obj ebi_obj;
@@ -134,6 +139,7 @@ typedef struct ebi_callframe ebi_callframe;
 
 struct ebi_obj {
 	uint8_t epoch;
+	uint32_t weak_slot;
 	ebi_type *type;
 	size_t count;
 };
@@ -177,6 +183,20 @@ typedef enum {
 	EBI_GC_SWEEP_SYNC,
 } ebi_gc_stage;
 
+typedef struct {
+	union {
+		ebi_obj *obj;
+		uint32_t next_free;
+	} val;
+	uint32_t gen;
+} ebi_weak_slot;
+
+typedef struct {
+	uint32_t hash;
+	uint32_t weak_ix;
+	uint32_t weak_gen;
+} ebi_intern_slot;
+
 struct ebi_vm {
 	// Hot data
 	uint32_t checkpoint;
@@ -202,6 +222,19 @@ struct ebi_vm {
 	// Misc
 	ebi_thread *main_thread;
 	ebi_types types;
+
+	// Weak references
+	ebi_mutex weak_mutex;
+	ebi_weak_slot *weak_slots;
+	size_t num_weak_slots;
+	size_t max_weak_slots;
+	uint32_t weak_free_head;
+
+	// Intern table (uses weak_mutex)
+	ebi_intern_slot *intern_slots;
+	size_t num_intern_slots;
+	size_t max_intern_slots;
+	size_t cap_intern_slots;
 };
 
 ebi_objlist *ebi_alloc_objlist(ebi_vm *vm)
@@ -359,6 +392,167 @@ void ebi_free_heavy(void *ptr)
 	_aligned_free(ptr);
 }
 
+ebi_weak_ref ebi_make_weak_ref_no_mutex(ebi_thread *et, ebi_ptr void *ptr)
+{
+	ebi_vm *vm = et->vm;
+	ebi_obj *obj = (ebi_obj*)ptr - 1;
+	ebi_weak_ref ref = 0;
+
+	ebi_mutex_lock(&vm->weak_mutex);
+
+	uint32_t gen, slot_ix = obj->weak_slot;
+	if (slot_ix == 0) {
+		slot_ix = vm->weak_free_head;
+		if (slot_ix != 0) {
+			vm->weak_free_head = vm->weak_slots[slot_ix].val.next_free;
+		} else {
+			if (vm->num_weak_slots >= vm->max_weak_slots) {
+				uint32_t prev_max = 0;
+				vm->max_weak_slots = ebi_grow_sz(vm->max_weak_slots, 64);
+				vm->weak_slots = realloc(vm->weak_slots, vm->max_weak_slots);
+				memset(vm->weak_slots + prev_max, 0,
+					(vm->max_weak_slots - prev_max) * sizeof(ebi_weak_slot));
+			}
+			slot_ix = vm->num_weak_slots++;
+		}
+		ebi_weak_slot *slot = &vm->weak_slots[slot_ix];
+		slot->val.obj = obj;
+		gen = ++slot->gen;
+		obj->weak_slot = slot_ix;
+
+	} else {
+		gen = vm->weak_slots[slot_ix].gen;
+	}
+	ebi_mutex_unlock(&vm->weak_mutex);
+
+	ref = (uint64_t)slot_ix << 32 | (uint64_t)gen;
+
+	return ref;
+}
+
+ebi_ptr void *ebi_resolve_weak_ref_no_mutex(ebi_thread *et, ebi_weak_ref ref)
+{
+	ebi_vm *vm = et->vm;
+
+	void *ptr = NULL;
+	uint32_t gen = (uint32_t)ref, slot_ix = (uint32_t)(ref >> 32);
+
+	ebi_weak_slot *slot = &vm->weak_slots[slot_ix];
+	if (slot->gen == gen) {
+		ebi_obj *obj = slot->val.obj;
+		ptr = obj + 1;
+		if (obj->epoch != et->epoch) {
+			// If this object hasn't been marked by the GC in this cycle
+			// we might be in trouble: If we're sweeping it's too late
+			// to revive this reference as it will be deleted, otherwise
+			// mark the object to make sure it doesn't get deleted.
+			ebi_mutex_lock(&vm->gc_mutex);
+			if (vm->gc_stage == EBI_GC_SWEEP) {
+				ptr = NULL;
+			} else {
+				ebi_mark(et, obj + 1);
+			}
+			ebi_mutex_unlock(&vm->gc_mutex);
+		}
+	}
+
+	return ptr;
+}
+
+bool ebi_is_weak_probably_valid_no_mutex(ebi_thread *et, uint32_t slot_ix, uint32_t gen)
+{
+	ebi_vm *vm = et->vm;
+
+	ebi_weak_slot *slot = &vm->weak_slots[slot_ix];
+	if (slot->gen == gen) {
+		ebi_obj *obj = slot->val.obj;
+		if (obj->epoch != et->epoch) {
+			return vm->gc_stage != EBI_GC_SWEEP;
+		} else {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+uint32_t ebi_intern_hash(const char *data, size_t length)
+{
+	uint32_t hash = 0x811c9dc5;
+	for (size_t i = 0; i < length; i++) {
+		hash = (hash ^ (uint8_t)data[i]) * 0x01000193;
+	}
+	return hash;
+}
+
+void ebi_intern_rehash(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+	ebi_intern_slot *slots = vm->intern_slots;
+
+	// Try to remove expired references first
+	uint32_t max_slots = vm->max_intern_slots;
+	uint32_t num_slots = vm->num_intern_slots;
+	uint32_t mask = max_slots - 1;
+	for (uint32_t i = 0; i < max_slots; i++) {
+		ebi_intern_slot *s = &slots[i];
+		if (!s->weak_ix) continue;
+		if (ebi_is_weak_probably_valid_no_mutex(et, s->weak_ix, s->weak_gen)) continue;
+
+		num_slots--;
+
+		// Shift back deletion
+		uint32_t next_i = (i + 1) & mask;
+		for (;;) {
+			ebi_intern_slot *sn = &slots[next_i];
+			if (!sn->weak_ix || (sn->hash & mask) == next_i) break;
+			*s = *sn;
+			s = sn;
+			next_i = (i + 1) & mask;
+		}
+		s->hash = 0;
+		s->weak_ix = 0;
+		s->weak_gen = 0;
+	}
+
+	// If we didn't manage to delete at least half of
+	// the entries re-hash into a larger map.
+	if (num_slots >= vm->cap_intern_slots / 2) {
+		vm->max_intern_slots = ebi_grow_sz(max_slots, 64);
+		size_t sz = vm->max_intern_slots * sizeof(ebi_intern_slot);
+		ebi_intern_slot *new_slots = malloc(vm->max_intern_slots);
+		memset(new_slots, 0, sz);
+
+		uint32_t new_mask = vm->max_intern_slots - 1;
+
+		for (uint32_t old_i = 0; old_i < max_slots; old_i++) {
+			ebi_intern_slot *s = &slots[old_i];
+			if (!s->weak_ix) continue;
+
+			ebi_intern_slot slot = *s;
+			uint32_t ix = slot.hash & new_mask;
+			uint32_t scan = 0;
+			for (;;) {
+				ebi_intern_slot *ns = &slots[ix];
+				uint32_t nscan = (ix - ns->hash) & new_mask;
+				if (!ns->weak_ix) {
+					*ns = slot;
+					break;
+				} else if (nscan < scan) {
+					*ns = slot;
+					slot = *ns;
+					scan = nscan;
+				}
+				scan++;
+				ix = (ix + 1) & mask;
+			}
+		}
+
+		// Use maximum capacity of 7/8
+		vm->cap_intern_slots = vm->max_intern_slots - vm->max_intern_slots / 8;
+	}
+}
+
 // API
 
 ebi_vm *ebi_make_vm()
@@ -385,6 +579,9 @@ ebi_vm *ebi_make_vm()
 	for (size_t i = 1; i < num_types; i++) {
 		p_types[i] = ebi_new(et, vm->types.type, 1);
 	}
+
+	// Reserve zero as NULL
+	vm->num_weak_slots = 1;
 
 	vm->types.char_->size = sizeof(char);
 	vm->types.u32->size = sizeof(uint32_t);
@@ -466,8 +663,7 @@ ebi_thread *ebi_make_thread(ebi_vm *vm)
 
 	ebi_mutex_lock(&vm->thread_mutex);
 	if (vm->num_threads == vm->max_threads) {
-		vm->max_threads = vm->max_threads * 2;
-		if (vm->max_threads == 0) vm->max_threads = 16;
+		vm->max_threads = ebi_grow_sz(vm->max_threads, 16);
 		vm->threads = realloc(vm->threads, vm->max_threads);
 	}
 	vm->threads[vm->num_threads++] = et;
@@ -647,6 +843,16 @@ bool ebi_gc_sweep(ebi_thread *et)
 		if (obj->epoch != bad_epoch) {
 			ebi_add_obj(et, obj);
 		} else {
+			if (obj->weak_slot) {
+				// TODO: Batch these
+				ebi_mutex_lock(&vm->weak_mutex);
+				ebi_weak_slot *slot = &vm->weak_slots[obj->weak_slot];
+				slot->val.next_free = vm->weak_free_head;
+				vm->weak_free_head = obj->weak_slot;
+				slot->gen++;
+				ebi_mutex_unlock(&vm->weak_mutex);
+			}
+
 			free(obj);
 		}
 	}
@@ -711,5 +917,96 @@ void ebi_gc_step(ebi_thread *et)
 		break;
 	}
 	ebi_mutex_unlock(&vm->gc_mutex);
+}
+
+ebi_weak_ref ebi_make_weak_ref(ebi_thread *et, ebi_ptr void *ptr)
+{
+	ebi_vm *vm = et->vm;
+
+	ebi_mutex_lock(&vm->weak_mutex);
+	ebi_weak_ref ref = ebi_make_weak_ref_no_mutex(et, ptr);
+	ebi_mutex_unlock(&vm->weak_mutex);
+
+	return ref;
+}
+
+ebi_ptr void *ebi_resolve_weak_ref(ebi_thread *et, ebi_weak_ref ref)
+{
+	ebi_vm *vm = et->vm;
+
+	ebi_mutex_lock(&vm->weak_mutex);
+	void *ptr = ebi_resolve_weak_ref_no_mutex(et, ref);
+	ebi_mutex_unlock(&vm->weak_mutex);
+
+	return ptr;
+}
+
+ebi_symbol ebi_intern(ebi_thread *et, const char *data, size_t length)
+{
+	ebi_vm *vm = et->vm;
+	uint32_t hash = ebi_intern_hash(data, length);
+
+	ebi_mutex_lock(&vm->weak_mutex);
+
+	if (vm->num_intern_slots == vm->cap_intern_slots) {
+		ebi_intern_rehash(et);
+	}
+
+	ebi_intern_slot *slots = vm->intern_slots;
+	uint32_t mask = vm->max_intern_slots - 1;
+	uint32_t ix = hash & mask;
+	uint32_t scan = 0;
+
+	ebi_intern_slot displaced = { 0 };
+
+	void *result = NULL;
+	for (;;) {
+		ebi_intern_slot *ns = &slots[ix];
+		uint32_t nscan = (ix - ns->hash) & mask;
+		if (!ns->weak_ix || nscan < scan) {
+			displaced = *ns;
+			scan = nscan;
+
+			char *copy = ebi_new_copy(et, vm->types.char_, length, data);
+			uint64_t weak = ebi_make_weak_ref_no_mutex(et, copy);
+
+			ns->hash = hash;
+			ns->weak_ix = (uint32_t)(weak >> 32);
+			ns->weak_gen = (uint32_t)weak;
+
+			result = copy;
+			break;
+		} else if (ns->hash == hash) {
+			uint64_t ref = (uint64_t)ns->weak_ix << 32 | (uint64_t)ns->weak_gen;
+			void *obj = ebi_resolve_weak_ref_no_mutex(et, ref);
+			if (obj && ebi_obj_count(obj) == length && !memcmp(obj, data, length)) {
+				result = obj;
+				break;
+			}
+		}
+		scan++;
+		ix = (ix + 1) & mask;
+	}
+
+	while (displaced.weak_ix) {
+		ebi_intern_slot *ns = &slots[ix];
+		uint32_t nscan = (ix - ns->hash) & mask;
+		if (!ns->weak_ix || nscan < scan) {
+			*ns = displaced;
+			displaced = *ns;
+			scan = nscan;
+		}
+		scan++;
+		ix = (ix + 1) & mask;
+	}
+
+	ebi_mutex_unlock(&vm->weak_mutex);
+
+	return (ebi_symbol)result;
+}
+
+ebi_symbol ebi_internz(ebi_thread *et, const char *data)
+{
+	return ebi_intern(et, data, strlen(data));
 }
 
