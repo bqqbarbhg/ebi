@@ -2,8 +2,8 @@
 
 #include "ebi_core.h"
 
-typedef struct ebi_compiler ebi_compiler;
 typedef struct ebi_token ebi_token;
+typedef struct ebi_ast ebi_ast;
 
 typedef enum {
 
@@ -37,6 +37,7 @@ typedef enum {
 	EBI_KW_LET,
 	EBI_KW_STRUCT,
 	EBI_KW_CLASS,
+	EBI_KW_RETURN,
 
 	EBI_TT_ERROR,
 	EBI_TT_ERROR_UNCLOSED_STRING,
@@ -47,9 +48,48 @@ typedef enum {
 
 } ebi_token_type;
 
+typedef enum {
+
+	EBI_AST_BLOCK,  // (block asts...)
+	EBI_AST_LIST,   // (list asts...)
+	EBI_AST_STRUCT, // (struct name generics fields)
+	EBI_AST_DEF,    // (def name generics params return body)
+	EBI_AST_FIELD,  // (field name type)
+	EBI_AST_NAME,   // (name)
+	EBI_AST_NULL,   // (null)
+	EBI_AST_RETURN, // (return expr)
+	EBI_AST_BINOP,  // (binop a b)
+
+	EBI_AST_COUNT,
+
+} ebi_ast_type;
+
 struct ebi_token {
 	ebi_token_type type;
 	ebi_symbol symbol;
 };
 
-void ebi_compile(ebi_thread *et, const char *source, size_t length);
+struct ebi_ast {
+	ebi_token token;
+	ebi_ast_type type;
+
+	size_t num_nodes;
+	union {
+		ebi_ast *nodes;
+		struct ebi_ast_struct *struct_;
+		struct ebi_ast_def *def_;
+		struct ebi_ast_field *field;
+		struct ebi_ast_return *return_;
+		struct ebi_ast_binop *binop;
+	};
+};
+
+struct ebi_ast_struct { ebi_ast name, generics, fields; };
+struct ebi_ast_def { ebi_ast name, generics, params, return_, body; };
+struct ebi_ast_field { ebi_ast name, type; };
+struct ebi_ast_return { ebi_ast expr; };
+struct ebi_ast_binop { ebi_ast a, b; };
+
+ebi_ast *ebi_parse(ebi_thread *et, const char *source, size_t length);
+
+

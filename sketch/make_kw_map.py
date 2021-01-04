@@ -4,6 +4,7 @@ kws = {
     "class": "EBI_KW_CLASS",
     "def": "EBI_KW_DEF",
     "let": "EBI_KW_LET",
+    "return": "EBI_KW_RETURN",
 }
 
 def kw_hash(s):

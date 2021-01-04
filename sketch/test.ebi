@@ -9,7 +9,7 @@ def dot(a: Vec2, b: Vec2): Int {
 }
 
 def main() {
-    let a: Vec2 = { 1, 2 }
-    let b: Vec2 = { 3, 4 }
+    let a = Vec2{ 1, 2 }
+    let b = Vec2{ 3, 4 }
     print("dot product:", dot(a, b))
 }
