@@ -532,7 +532,7 @@ bool ebi_parse_params(ebi_parser *ep, ebi_ast *ast)
 		}
 	}
 
-	ebi_end_ast_list(ep, begin, ast, EBI_AST_BLOCK, &tok);
+	ebi_end_ast_list(ep, begin, ast, EBI_AST_LIST, &tok);
 
 	return true;
 }
