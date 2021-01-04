@@ -1,6 +1,8 @@
 #include "ebi_compiler.h"
 
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 // Copyright (c) 2008-2009 Bjoern Hoehrmann <bjoern@hoehrmann.de>
 //
@@ -107,7 +109,7 @@ static ebi_forceinline bool ebi_is_identifier(uint32_t codep) {
 #define EBI_IDENT_CAHCE_SCAN 32
 
 const char *const ebi_tt_names[] = {
-	"end of line", "end of file",
+	"null", "end-of-line", "end-of-file",
 	"identifier", "number", "string",
 	"'.'", "':'", "','",
 	"'('", "')'", "'{'", "'}'", "'['", "']'",
@@ -119,6 +121,12 @@ const char *const ebi_tt_names[] = {
 	"error", "unclosed string", "bad utf-8", "bad token",
 };
 ebi_static_assert(tt_name_count, ebi_arraycount(ebi_tt_names) == EBI_TT_COUNT);
+
+const char *const ebi_ast_names[] = {
+	"null", "block", "list", "struct", "def", "param", "name", "return",
+	"binop", "field", "call",
+};
+ebi_static_assert(ast_name_count, ebi_arraycount(ebi_ast_names) == EBI_AST_COUNT);
 
 typedef struct {
 	uint32_t hash;
@@ -137,6 +145,11 @@ typedef struct {
 
 	uint32_t ident_lru;
 	ebi_cached_ident ident_cache[EBI_IDENT_CAHCE_SIZE];
+
+	ebi_ast *temp_asts;
+	size_t num_temp_asts;
+	size_t max_temp_asts;
+
 } ebi_parser;
 
 ebi_symbol ebi_compiler_intern(ebi_parser *ep, const char *data, size_t length, uint32_t hash)
@@ -337,44 +350,75 @@ ebi_forceinline bool ebi_accept(ebi_parser *ep, ebi_token_type tt)
 	}
 }
 
-void ebi_push_ast(ebi_parser *ep, ebi_ast_type type, const ebi_token *token)
+void ebi_init_ast(ebi_parser *ep, ebi_ast *ast, ebi_ast_type type,
+	size_t num_nodes, const ebi_token *token)
 {
+	ast->type = type;
+	ast->num_nodes = num_nodes;
+	if (num_nodes) {
+		// TODO: Pool
+		ast->nodes = calloc(num_nodes, sizeof(ebi_ast));
+	}
+	if (token) ast->token = *token;
 }
 
-void ebi_pop_ast(ebi_parser *ep)
+size_t ebi_begin_ast_list(ebi_parser *ep)
 {
+	return ep->num_temp_asts;
 }
 
-void ebi_add_ast(ebi_parser *ep, ebi_ast_type type, const ebi_token *token)
+void ebi_end_ast_list(ebi_parser *ep, size_t begin, ebi_ast *ast,
+	ebi_ast_type type, const ebi_token *token)
 {
+	ast->type = type;
+	ast->num_nodes = ep->num_temp_asts - begin;
+	size_t sz = ast->num_nodes * sizeof(ebi_ast);
+	// TODO: Pool
+	ast->nodes = malloc(sz);
+	memcpy(ast->nodes, ep->temp_asts + begin, sz);
+	ep->num_temp_asts = begin;
+	if (token) ast->token = *token;
+}
+
+void ebi_push_ast_list(ebi_parser *ep, const ebi_ast *ast)
+{
+	if (ep->num_temp_asts == ep->max_temp_asts) {
+		ep->max_temp_asts *= 2;
+		if (ep->max_temp_asts < 16) ep->max_temp_asts = 16;
+		size_t sz = ep->max_temp_asts * sizeof(ebi_ast);
+		ep->temp_asts = (ebi_ast*)realloc(ep->temp_asts, sz);
+	}
+	ep->temp_asts[ep->num_temp_asts] = *ast;
+	ep->num_temp_asts++;
 }
 
 void ebi_perror(ebi_parser *ep, const char *msg, ...)
 {
+	ebi_assert(0 && "TODO");
 }
 
-bool ebi_parse_name(ebi_parser *ep, const char *hint)
+bool ebi_parse_name(ebi_parser *ep, ebi_ast *ast, const char *hint)
 {
 	if (!ebi_accept(ep, EBI_TT_IDENT)) {
 		ebi_perror(ep, "Expected name for %s", hint);
 		return false;
 	}
 
-	ebi_add_ast(ep, EBI_AST_NAME, &ep->prev_token);
+	ebi_init_ast(ep, ast, EBI_AST_NAME, 0, &ep->prev_token);
 
 	return true;
 }
 
-bool ebi_parse_type(ebi_parser *ep)
+bool ebi_parse_type(ebi_parser *ep, ebi_ast *ast)
 {
 	if (ebi_accept(ep, EBI_TT_LPAREN)) {
-		ebi_parse_type(ep);
+		if (!ebi_parse_type(ep, ast)) return false;
 		if (!ebi_accept(ep ,EBI_TT_RPAREN)) {
 			ebi_perror(ep, "Expected a closing ')'");
 			return false;
 		}
 	} else if (ebi_accept(ep, EBI_TT_IDENT)) {
-		ebi_add_ast(ep, EBI_AST_NAME, &ep->prev_token);
+		ebi_init_ast(ep, ast, EBI_AST_NAME, 0, &ep->prev_token);
 	} else {
 		ebi_perror(ep, "Expected a type");
 	}
@@ -382,10 +426,33 @@ bool ebi_parse_type(ebi_parser *ep)
 	return true;
 }
 
-bool ebi_parse_generics(ebi_parser *ep)
+bool ebi_parse_param(ebi_parser *ep, ebi_ast *ast, const char *hint)
+{
+	ebi_init_ast(ep, ast, EBI_AST_PARAM, 2, &ep->token);
+
+	if (!ebi_accept(ep, EBI_TT_IDENT)) {
+		ebi_perror(ep, "Expected name for ", hint);
+		return false;
+	}
+	ebi_init_ast(ep, &ast->param->name, EBI_AST_NAME, 0, &ep->prev_token);
+
+	if (!ebi_accept(ep, EBI_TT_COLON)) {
+		ebi_perror(ep, "Expected ':' before type");
+		return false;
+	}
+
+	if (!ebi_parse_type(ep, &ast->param->type)) return false;
+
+	ebi_push_ast_list(ep, ast);
+
+	return true;
+}
+
+bool ebi_parse_generics(ebi_parser *ep, ebi_ast *ast)
 {
 	if (ebi_accept(ep, EBI_TT_LSQUARE)) {
-		ebi_push_ast(ep, EBI_AST_LIST, &ep->prev_token);
+		ebi_token tok = ep->prev_token;
+		size_t begin = ebi_begin_ast_list(ep);
 
 		if (ebi_accept(ep, EBI_TT_RSQUARE)) {
 			ebi_perror(ep, "Generic list cannot be empty");
@@ -393,7 +460,9 @@ bool ebi_parse_generics(ebi_parser *ep)
 		}
 
 		do {
-			ebi_parse_name(ep, "generic parameter");
+			ebi_ast name;
+			if (!ebi_parse_name(ep, &name, "generic parameter")) return false;
+			ebi_push_ast_list(ep, &name);
 		} while (ebi_accept(ep, EBI_TT_COMMA));
 
 		if (!ebi_accept(ep, EBI_TT_RSQUARE)) {
@@ -401,130 +470,238 @@ bool ebi_parse_generics(ebi_parser *ep)
 			return false;
 		}
 
-		ebi_pop_ast(ep);
-	} else {
-		ebi_add_ast(ep, EBI_AST_LIST, NULL);
+		ebi_end_ast_list(ep, begin, ast, EBI_AST_LIST, &tok);
 	}
 
 	return true;
 }
 
-bool ebi_parse_fields(ebi_parser *ep)
+bool ebi_parse_fields(ebi_parser *ep, ebi_ast *ast, ebi_token tok)
 {
-	ebi_push_ast(ep, EBI_AST_LIST, &ep->prev_token);
+	size_t begin = ebi_begin_ast_list(ep);
 
 	while (!ebi_accept(ep, EBI_TT_RCURLY)) {
 		if (ebi_accept(ep, EBI_TT_LINE_END)) continue;
 
-		if (ebi_accept(ep, EBI_TT_IDENT)) {
-			ebi_push_ast(ep, EBI_AST_FIELD, &ep->prev_token);
-			ebi_add_ast(ep, EBI_AST_NAME, &ep->prev_token);
-
-			if (!ebi_accept(EBI_TT_COLON)) {
-				ebi_perror(ep, "Expected ':' before type");
-				return false;
-			}
-
-			ebi_parse_type(ep);
-
-			ebi_pop_ast(ep);
-		} else {
-			ebi_perror(ep, "Expected a field");
-			return false;
-		}
+		ebi_ast param;
+		if (!ebi_parse_param(ep, &param, "struct field")) return false;
+		ebi_push_ast_list(ep, &param);
 	}
 
-	ebi_pop_ast(ep);
+	ebi_end_ast_list(ep, begin, ast, EBI_AST_LIST, &tok);
 
 	return true;
 }
 
-bool ebi_parse_struct(ebi_parser *ep)
+bool ebi_parse_struct(ebi_parser *ep, ebi_ast *ast, ebi_token tok)
 {
-	ebi_push_ast(ep, EBI_AST_STRUCT, &ep->prev_token);
+	ebi_init_ast(ep, ast, EBI_AST_STRUCT, 3, &tok);
 
-	ebi_parse_name(ep, "struct");
-	ebi_parse_generics(ep);
+	if (!ebi_parse_name(ep, &ast->struct_->name, "struct")) return false;
+	if (!ebi_parse_generics(ep, &ast->struct_->generics)) return false;
 
 	if (ebi_accept(ep, EBI_TT_LCURLY)) {
-		ebi_parse_fields(ep);
-	} else {
-		ebi_add_ast(ep, EBI_AST_NULL, NULL);
+		if (!ebi_parse_fields(ep, &ast->struct_->fields, ep->prev_token)) {
+			return false;
+		}
 	}
 
-	ebi_pop_ast(ep);
+	return true;
 }
 
-bool ebi_parse_param_defs(ebi_parser *ep)
+bool ebi_parse_params(ebi_parser *ep, ebi_ast *ast)
 {
 	if (!ebi_accept(ep, EBI_TT_LPAREN)) {
 		ebi_perror(ep, "Expected '(' for parameters");
 		return false;
 	}
+	ebi_token tok = ep->prev_token;
 
+	size_t begin = ebi_begin_ast_list(ep);
+
+	if (!ebi_accept(ep, EBI_TT_RPAREN)) {
+		do {
+			ebi_ast param;
+			if (!ebi_parse_param(ep, &param, "parameter")) return false;
+			ebi_push_ast_list(ep, &param);
+		} while (ebi_accept(ep, EBI_TT_COMMA));
+
+		if (!ebi_accept(ep, EBI_TT_RPAREN)) {
+			ebi_perror(ep, "Expected closing ')' for parameter list");
+			return false;
+		}
+	}
+
+	ebi_end_ast_list(ep, begin, ast, EBI_AST_BLOCK, &tok);
+
+	return true;
 }
 
-bool ebi_parse_block(ebi_parser *ep, ebi_token_type end);
+bool ebi_parse_block(ebi_parser *ep, ebi_ast *ast, ebi_token_type end, ebi_token tok);
 
-bool ebi_parse_def(ebi_parser *ep)
+bool ebi_parse_def(ebi_parser *ep, ebi_ast *ast, ebi_token tok)
 {
-	ebi_push_ast(ep, EBI_AST_DEF, &ep->prev_token);
+	ebi_init_ast(ep, ast, EBI_AST_DEF, 5, &tok);
 
-	ebi_parse_name(ep, "function");
-	ebi_parse_generics(ep);
-	ebi_parse_param_defs(ep);
+	if (!ebi_parse_name(ep, &ast->def->name, "function")) return false;
+	if (!ebi_parse_generics(ep, &ast->def->generics)) return false;
+	if (!ebi_parse_params(ep, &ast->def->params)) return false;
 
 	if (ebi_accept(ep, EBI_TT_COLON)) {
-		ebi_parse_type(ep);
-	} else {
-		ebi_add_ast(ep, EBI_AST_NULL, NULL);
+		if (!ebi_parse_type(ep, &ast->def->return_)) return false;
 	}
 
 	if (ebi_accept(ep, EBI_TT_LCURLY)) {
-		ebi_push_ast(ep, EBI_AST_BLOCK, &ep->prev_token);
-		ebi_parse_block(ep, EBI_TT_RCURLY);
-		ebi_pop_ast(ep);
+		if (!ebi_parse_block(ep, &ast->def->body, EBI_TT_RCURLY, ep->prev_token)) {
+			return false;
+		}
 	}
 
-	ebi_pop_ast(ep);
+	return true;
 }
 
-bool ebi_parse_statement(ebi_parser *ep)
+bool ebi_parse_expression(ebi_parser *ep, ebi_ast *ast);
+
+bool ebi_parse_atom(ebi_parser *ep, ebi_ast *ast)
+{
+	if (ebi_accept(ep, EBI_TT_LPAREN)) {
+		if (!ebi_parse_expression(ep, ast)) return false;
+		if (!ebi_accept(ep, EBI_TT_RPAREN)) {
+			ebi_perror(ep, "Expected closing ')'");
+			return false;
+		}
+	} else if (ebi_accept(ep, EBI_TT_IDENT)) {
+		ebi_init_ast(ep, ast, EBI_AST_NAME, 0, &ep->prev_token);
+	}
+
+	return true;
+}
+
+bool ebi_parse_args(ebi_parser *ep, ebi_ast *ast, ebi_token tok)
+{
+	size_t begin = ebi_begin_ast_list(ep);
+
+	while (!ebi_accept(ep, EBI_TT_RPAREN)) {
+		ebi_ast param;
+		if (!ebi_parse_expression(ep, &param)) return false;
+		ebi_push_ast_list(ep, &param);
+	}
+
+	ebi_end_ast_list(ep, begin, ast, EBI_AST_LIST, &tok);
+	return true;
+}
+
+bool ebi_parse_suffix(ebi_parser *ep, ebi_ast *ast)
+{
+	if (!ebi_parse_atom(ep, ast)) return false;
+
+	for (;;) {
+		if (ebi_accept(ep, EBI_TT_DOT)) {
+			ebi_ast field;
+			ebi_init_ast(ep, &field, EBI_AST_FIELD, 2, &ep->prev_token);
+
+			field.field->expr = *ast;
+			if (!ebi_accept(ep, EBI_TT_IDENT)) {
+				ebi_perror(ep, "Expected field name");
+				return false;
+			}
+			ebi_init_ast(ep, &field.field->name, EBI_AST_NAME, 0, &ep->prev_token);
+
+			*ast = field;
+		} else if (ebi_accept(ep, EBI_TT_LPAREN)) {
+			ebi_token tok = ep->prev_token;
+
+			ebi_ast call;
+			ebi_init_ast(ep, &call, EBI_AST_CALL, 2, &tok);
+
+			call.call->expr = *ast;
+			if (!ebi_parse_args(ep, &call.call->args, tok)) return false;
+
+			*ast = call;
+		} else {
+			break;
+		}
+	}
+
+	return true;
+}
+
+bool ebi_parse_term(ebi_parser *ep, ebi_ast *ast)
+{
+	if (!ebi_parse_suffix(ep, ast)) return false;
+
+	while (ep->token.type == EBI_TT_MUL || ep->token.type == EBI_TT_DIV
+		|| ep->token.type == EBI_TT_MOD) {
+		ebi_ast binop;
+		ebi_init_ast(ep, &binop, EBI_AST_BINOP, 2, &ep->token);
+		ebi_scan(ep);
+		
+		binop.binop->a = *ast;
+		ebi_parse_suffix(ep, &binop.binop->b);
+		*ast = binop;
+	}
+
+	return true;
+}
+
+bool ebi_parse_expression(ebi_parser *ep, ebi_ast *ast)
+{
+	if (!ebi_parse_term(ep, ast)) return false;
+
+	while (ep->token.type == EBI_TT_ADD || ep->token.type == EBI_TT_SUB) {
+		ebi_ast binop;
+		ebi_init_ast(ep, &binop, EBI_AST_BINOP, 2, &ep->token);
+		ebi_scan(ep);
+		
+		binop.binop->a = *ast;
+		if (!ebi_parse_term(ep, &binop.binop->b)) return false;
+		*ast = binop;
+	}
+
+	return true;
+}
+
+bool ebi_parse_statement(ebi_parser *ep, ebi_ast *ast)
 {
 	if (ebi_accept(ep, EBI_TT_LCURLY)) {
-		ebi_push_ast(ep, EBI_AST_BLOCK, &ep->prev_token);
-		ebi_parse_block(ep, EBI_TT_RCURLY);
-		ebi_pop_ast(ep);
+		if (!ebi_parse_block(ep, ast, EBI_TT_RCURLY, ep->prev_token)) return false;
 	} else if (ebi_accept(ep, EBI_KW_RETURN)) {
+		ebi_init_ast(ep, ast, EBI_AST_RETURN, 1, &ep->prev_token);
+		if (!ebi_accept(ep, EBI_TT_LINE_END)) {
+			if (!ebi_parse_expression(ep, &ast->return_->expr)) return false;
+		}
 	}
+
+	return true;
 }
 
-bool ebi_parse_block(ebi_parser *ep, ebi_token_type end)
+bool ebi_parse_block(ebi_parser *ep, ebi_ast *ast, ebi_token_type end, ebi_token tok)
 {
+	size_t begin = ebi_begin_ast_list(ep);
+
 	while (!ebi_accept(ep, end)) {
 		if (ebi_accept(ep, EBI_TT_LINE_END)) continue;
 
+		ebi_ast ast;
 		if (ebi_accept(ep, EBI_KW_STRUCT)) {
-			ebi_parse_struct(ep);
+			ebi_parse_struct(ep, &ast, ep->prev_token);
 		} else if (ebi_accept(ep, EBI_KW_DEF)) {
-			ebi_parse_def(ep);
+			ebi_parse_def(ep, &ast, ep->prev_token);
 		} else {
-			ebi_parse_statement(ep);
+			ebi_parse_statement(ep, &ast);
 		}
+		ebi_push_ast_list(ep, &ast);
 	}
+
+	ebi_end_ast_list(ep, begin, ast, EBI_AST_BLOCK, &tok);
+	return true;
 }
 
-bool ebi_parse_root(ebi_parser *ep)
+bool ebi_parse_root(ebi_parser *ep, ebi_ast *ast)
 {
-	ebi_push_ast(ep, EBI_AST_BLOCK, NULL);
-
-	ebi_parse_block(ep, EBI_TT_FILE_END);
-
-	ebi_pop_ast(ep);
+	return ebi_parse_block(ep, ast, EBI_TT_FILE_END, ep->token);
 }
 
-// DEBUG
-#include <stdio.h>
 
 ebi_ast *ebi_parse(ebi_thread *et, const char *source, size_t length)
 {
@@ -532,15 +709,36 @@ ebi_ast *ebi_parse(ebi_thread *et, const char *source, size_t length)
 	ep.src_ptr = source;
 	ep.src_end = source + length;
 
-	for (;;) {
-		ebi_scan(&ep);
-		if (ep.token.symbol.data) {
-			printf("%s: %.*s\n", ebi_tt_names[ep.token.type],
-				(int)ebi_obj_count(ep.token.symbol.data),
-				ep.token.symbol.data);
-		} else {
-			printf("%s\n", ebi_tt_names[ep.token.type]);
+	ebi_ast *root = calloc(1, sizeof(ebi_ast));
+
+	ebi_scan(&ep);
+	ebi_parse_root(&ep, root);
+
+	return root;
+}
+
+void ebi_dump_ast(ebi_ast *ast, int indent)
+{
+	for (int i = 0; i < indent; i++) printf("  ");
+	if (ast->token.symbol.data) {
+		printf("(%s %s '%.*s'",
+			ebi_ast_names[ast->type],
+			ebi_tt_names[ast->token.type],
+			(int)ebi_obj_count(ast->token.symbol.data),
+			ast->token.symbol.data);
+	} else {
+		printf("(%s %s",
+			ebi_ast_names[ast->type],
+			ebi_tt_names[ast->token.type]);
+	}
+	if (ast->num_nodes > 0) {
+		printf("\n");
+		for (size_t i = 0; i < ast->num_nodes; i++) {
+			ebi_dump_ast(&ast->nodes[i], indent + 1);
 		}
-		if (ep.token.type == EBI_TT_FILE_END) break;
+		for (int i = 0; i < indent; i++) printf("  ");
+		printf(")\n");
+	} else {
+		printf(")\n");
 	}
 }

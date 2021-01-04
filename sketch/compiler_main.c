@@ -19,7 +19,8 @@ int main(int argc, char **argv)
 	ebi_vm *vm = ebi_make_vm();
 	ebi_thread *et = ebi_make_thread(vm);
 
-	ebi_compile(et, data, size);
+	ebi_ast *ast = ebi_parse(et, data, size);
+	ebi_dump_ast(ast, 0);
 
 	return 0;
 }

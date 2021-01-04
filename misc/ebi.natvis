@@ -4,9 +4,28 @@
     <DisplayString>{ (char*)data+begin,[length]s }</DisplayString>
   </Type>
   <Type Name="ebi_symbol">
+    <DisplayString Condition="!data">null</DisplayString>
     <DisplayString>{ data,[((ebi_obj*)data-1)->count]s }</DisplayString>
   </Type>
   <Type Name="ebi_type">
     <DisplayString>{ name }</DisplayString>
+  </Type>
+  <Type Name="ebi_ast">
+	  <DisplayString>{ type } { ident }</DisplayString>
+	  <Expand>
+		  <Item Name="type">type</Item>
+		  <Item Name="ident">ident</Item>
+		  <Item Name="struct" Condition="type == EBI_AST_STRUCT">struct_</Item>
+		  <Item Name="def" Condition="type == EBI_AST_DEF">def</Item>
+		  <Item Name="param" Condition="type == EBI_AST_PARAM">param</Item>
+		  <Item Name="field" Condition="type == EBI_AST_FIELD">field</Item>
+		  <Item Name="return" Condition="type == EBI_AST_RETURN">return_</Item>
+		  <Item Name="binop" Condition="type == EBI_AST_BINOP">binop</Item>
+		  <Item Name="call" Condition="type == EBI_AST_CALL">call</Item>
+		  <ArrayItems Condition="type == EBI_AST_LIST || type == EBI_AST_BLOCK">
+			  <Size>num_nodes</Size>
+			  <ValuePointer>nodes</ValuePointer>
+		  </ArrayItems>
+	  </Expand>
   </Type>
 </AutoVisualizer>

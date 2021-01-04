@@ -407,7 +407,7 @@ ebi_weak_ref ebi_make_weak_ref_no_mutex(ebi_thread *et, ebi_ptr void *ptr)
 			if (vm->num_weak_slots >= vm->max_weak_slots) {
 				uint32_t prev_max = 0;
 				vm->max_weak_slots = ebi_grow_sz(vm->max_weak_slots, 64);
-				vm->weak_slots = realloc(vm->weak_slots, vm->max_weak_slots);
+				vm->weak_slots = realloc(vm->weak_slots, vm->max_weak_slots * sizeof(ebi_weak_slot));
 				memset(vm->weak_slots + prev_max, 0,
 					(vm->max_weak_slots - prev_max) * sizeof(ebi_weak_slot));
 			}
