@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 #define ebi_assert(cond) do { if (!(cond)) __debugbreak(); } while (0)
+#define ebi_static_assert(name, cond) typedef int ebi_assert_##name[(cond) ? 1 : -1]
 #define ebi_arraycount(arr) (sizeof(arr)/sizeof(*(arr)))
 #define ebi_ptr
 #define ebi_arr
@@ -17,7 +18,7 @@ typedef struct ebi_type ebi_type;
 typedef struct ebi_string ebi_string;
 typedef struct ebi_type_desc ebi_type_desc;
 typedef struct ebi_types ebi_types;
-typedef ebi_arr char *ebi_symbol;
+typedef struct ebi_symbol ebi_symbol;
 typedef uint64_t ebi_weak_ref;
 
 struct ebi_string {
@@ -39,6 +40,10 @@ struct ebi_types {
 	ebi_type *string;
 	ebi_type *object;
 	ebi_type *type_desc;
+};
+
+struct ebi_symbol {
+	ebi_arr char *data;
 };
 
 ebi_vm *ebi_make_vm();

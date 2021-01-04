@@ -33,10 +33,17 @@ typedef enum {
 
 	EBI_TT_RD_ARROW,
 
+	EBI_KW_DEF,
+	EBI_KW_LET,
+	EBI_KW_STRUCT,
+	EBI_KW_CLASS,
+
 	EBI_TT_ERROR,
 	EBI_TT_ERROR_UNCLOSED_STRING,
 	EBI_TT_ERROR_BAD_UTF8,
 	EBI_TT_ERROR_BAD_TOKEN,
+
+	EBI_TT_COUNT,
 
 } ebi_token_type;
 
@@ -44,3 +51,5 @@ struct ebi_token {
 	ebi_token_type type;
 	ebi_symbol symbol;
 };
+
+void ebi_compile(ebi_thread *et, const char *source, size_t length);

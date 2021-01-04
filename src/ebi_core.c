@@ -92,7 +92,7 @@ void ebi_mutex_lock(ebi_mutex *m)
 {
 	uint32_t cmp = 1;
 	for (;;) {
-		if (!_interlockedbittestandset((volatile long*)&m->lock, 1)) break;
+		if (!_interlockedbittestandset((volatile long*)&m->lock, 0)) break;
 		_InterlockedIncrement((volatile long*)&m->waiters);
 		WaitOnAddress(&m->lock, &cmp, 4, INFINITE);
 		_InterlockedDecrement((volatile long*)&m->waiters);
@@ -101,7 +101,7 @@ void ebi_mutex_lock(ebi_mutex *m)
 
 bool ebi_mutex_try_lock(ebi_mutex *m)
 {
-	return !_interlockedbittestandset((volatile long*)&m->lock, 1);
+	return !_interlockedbittestandset((volatile long*)&m->lock, 0);
 }
 
 void ebi_mutex_unlock(ebi_mutex *m)
@@ -116,7 +116,7 @@ void ebi_mutex_unlock(ebi_mutex *m)
 
 static ebi_forceinline size_t ebi_grow_sz(size_t size, size_t min)
 {
-	size = size > min ? size * 2 : min;
+	return size > min ? size * 2 : min;
 }
 
 // -- Core
@@ -289,7 +289,7 @@ bool ebi_thread_barrier(ebi_thread *et)
 	return true;
 }
 
-ebi_forceinline size_t ebi_obj_count(void *ptr)
+size_t ebi_obj_count(ebi_arr void *ptr)
 {
 	if (!ptr) return 0;
 	ebi_obj *obj = (ebi_obj*)ptr - 1;
@@ -398,8 +398,6 @@ ebi_weak_ref ebi_make_weak_ref_no_mutex(ebi_thread *et, ebi_ptr void *ptr)
 	ebi_obj *obj = (ebi_obj*)ptr - 1;
 	ebi_weak_ref ref = 0;
 
-	ebi_mutex_lock(&vm->weak_mutex);
-
 	uint32_t gen, slot_ix = obj->weak_slot;
 	if (slot_ix == 0) {
 		slot_ix = vm->weak_free_head;
@@ -413,7 +411,7 @@ ebi_weak_ref ebi_make_weak_ref_no_mutex(ebi_thread *et, ebi_ptr void *ptr)
 				memset(vm->weak_slots + prev_max, 0,
 					(vm->max_weak_slots - prev_max) * sizeof(ebi_weak_slot));
 			}
-			slot_ix = vm->num_weak_slots++;
+			slot_ix = (uint32_t)vm->num_weak_slots++;
 		}
 		ebi_weak_slot *slot = &vm->weak_slots[slot_ix];
 		slot->val.obj = obj;
@@ -423,7 +421,6 @@ ebi_weak_ref ebi_make_weak_ref_no_mutex(ebi_thread *et, ebi_ptr void *ptr)
 	} else {
 		gen = vm->weak_slots[slot_ix].gen;
 	}
-	ebi_mutex_unlock(&vm->weak_mutex);
 
 	ref = (uint64_t)slot_ix << 32 | (uint64_t)gen;
 
@@ -491,8 +488,8 @@ void ebi_intern_rehash(ebi_thread *et)
 	ebi_intern_slot *slots = vm->intern_slots;
 
 	// Try to remove expired references first
-	uint32_t max_slots = vm->max_intern_slots;
-	uint32_t num_slots = vm->num_intern_slots;
+	uint32_t max_slots = (uint32_t)vm->max_intern_slots;
+	uint32_t num_slots = (uint32_t)vm->num_intern_slots;
 	uint32_t mask = max_slots - 1;
 	for (uint32_t i = 0; i < max_slots; i++) {
 		ebi_intern_slot *s = &slots[i];
@@ -520,10 +517,10 @@ void ebi_intern_rehash(ebi_thread *et)
 	if (num_slots >= vm->cap_intern_slots / 2) {
 		vm->max_intern_slots = ebi_grow_sz(max_slots, 64);
 		size_t sz = vm->max_intern_slots * sizeof(ebi_intern_slot);
-		ebi_intern_slot *new_slots = malloc(vm->max_intern_slots);
+		ebi_intern_slot *new_slots = malloc(sz);
 		memset(new_slots, 0, sz);
 
-		uint32_t new_mask = vm->max_intern_slots - 1;
+		uint32_t new_mask = (uint32_t)vm->max_intern_slots - 1;
 
 		for (uint32_t old_i = 0; old_i < max_slots; old_i++) {
 			ebi_intern_slot *s = &slots[old_i];
@@ -549,6 +546,8 @@ void ebi_intern_rehash(ebi_thread *et)
 		}
 
 		// Use maximum capacity of 7/8
+		free(vm->intern_slots);
+		vm->intern_slots = new_slots;
 		vm->cap_intern_slots = vm->max_intern_slots - vm->max_intern_slots / 8;
 	}
 }
@@ -687,6 +686,7 @@ void *ebi_new(ebi_thread *et, ebi_type *type, size_t count)
 	memset(data, 0, size);
 
 	obj->epoch = et->epoch;
+	obj->weak_slot = 0;
 	obj->type = type;
 	obj->count = count;
 
@@ -704,6 +704,7 @@ void *ebi_new_uninit(ebi_thread *et, ebi_type *type, size_t count)
 	void *data = obj + 1;
 
 	obj->epoch = et->epoch;
+	obj->weak_slot = 0;
 	obj->type = type;
 	obj->count = count;
 
@@ -722,6 +723,7 @@ void *ebi_new_copy(ebi_thread *et, ebi_type *type, size_t count, const void *ini
 	memcpy(data, init, size);
 
 	obj->epoch = et->epoch;
+	obj->weak_slot = 0;
 	obj->type = type;
 	obj->count = count;
 
@@ -953,7 +955,7 @@ ebi_symbol ebi_intern(ebi_thread *et, const char *data, size_t length)
 	}
 
 	ebi_intern_slot *slots = vm->intern_slots;
-	uint32_t mask = vm->max_intern_slots - 1;
+	uint32_t mask = (uint32_t)vm->max_intern_slots - 1;
 	uint32_t ix = hash & mask;
 	uint32_t scan = 0;
 
@@ -1002,7 +1004,8 @@ ebi_symbol ebi_intern(ebi_thread *et, const char *data, size_t length)
 
 	ebi_mutex_unlock(&vm->weak_mutex);
 
-	return (ebi_symbol)result;
+	ebi_symbol sym = { result };
+	return sym;
 }
 
 ebi_symbol ebi_internz(ebi_thread *et, const char *data)
