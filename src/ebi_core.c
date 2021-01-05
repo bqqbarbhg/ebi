@@ -141,13 +141,6 @@ struct ebi_obj {
 	uint8_t epoch;
 	uint32_t weak_slot;
 	ebi_type *type;
-	size_t count;
-};
-
-struct ebi_type {
-	size_t size;
-	ebi_arr uint32_t *slots;
-	ebi_string name;
 };
 
 struct ebi_callframe {
@@ -289,13 +282,6 @@ bool ebi_thread_barrier(ebi_thread *et)
 	return true;
 }
 
-size_t ebi_obj_count(ebi_arr void *ptr)
-{
-	if (!ptr) return 0;
-	ebi_obj *obj = (ebi_obj*)ptr - 1;
-	return obj->count;
-}
-
 ebi_forceinline void ebi_mark(ebi_thread *et, void *ptr)
 {
 	if (!ptr) return;
@@ -303,7 +289,7 @@ ebi_forceinline void ebi_mark(ebi_thread *et, void *ptr)
 	if (obj->epoch == et->epoch) return;
 	obj->epoch = et->epoch;
 
-	if (obj->type->slots) {
+	if (obj->type->flags & EBI_TYPE_HAS_REFS) {
 		ebi_objlist *list = et->objs_mark;
 		if (list->count == EBI_OBJLIST_SIZE) {
 			list = ebi_flush_marks(et);
@@ -321,21 +307,66 @@ ebi_forceinline void ebi_add_obj(ebi_thread *et, ebi_obj *obj)
 	list->objs[list->count++] = obj;
 }
 
-void ebi_mark_slots(ebi_thread *et, void *ptr, ebi_type *type, size_t count)
+void ebi_mark_slots(ebi_thread *et, void *ptr, ebi_type *type)
 {
 	ebi_mark(et, type);
-	if (!type->slots) return;
+	if ((type->flags & EBI_TYPE_HAS_REFS) == 0) return;
+
+	char *inst_ptr = (char*)ptr;
+	size_t num_fields = type->num_fields;
+	ebi_field *begin = type->fields, *end = begin + num_fields;
+	for (ebi_field *f = begin; f != end; f++) {
+		if (f->flags & EBI_FIELD_IS_REF) {
+			ebi_mark(et, *(void**)(inst_ptr + f->offset));
+		} else if (f->flags & EBI_TYPE_HAS_REFS) {
+			ebi_mark_slots(et, inst_ptr + f->offset, f->type);
+		}
+	}
+}
+
+void ebi_mark_slots_many(ebi_thread *et, void *ptr, ebi_type *type, size_t count)
+{
+	ebi_mark(et, type);
+	if ((type->flags & EBI_TYPE_HAS_REFS) == 0) return;
 
 	char *inst_ptr = (char*)ptr;
 
-	size_t num_slots = ebi_obj_count(type->slots);
-	size_t stride = type->size;
-	uint32_t *begin = type->slots, *end = begin + num_slots;
+	size_t num_fields = type->num_fields;
+	size_t stride = type->data_size;
+	ebi_field *begin = type->fields, *end = begin + num_fields;
 	for (; count > 0; count--) {
-		for (uint32_t *slot = begin; slot != end; slot++) {
-			ebi_mark(et, *(void**)(inst_ptr + *slot));
+		for (ebi_field *f = begin; f != end; f++) {
+			if (f->flags & EBI_FIELD_IS_REF) {
+				ebi_mark(et, *(void**)(inst_ptr + f->offset));
+			} else if (f->flags & EBI_TYPE_HAS_REFS) {
+				ebi_mark_slots(et, inst_ptr + f->offset, f->type);
+			}
 		}
 		inst_ptr += stride;
+	}
+}
+
+void ebi_mark_slots_heap(ebi_thread *et, void *ptr, ebi_type *type)
+{
+	ebi_mark(et, type);
+	if ((type->flags & EBI_TYPE_HAS_REFS) == 0) return;
+
+	char *inst_ptr = (char*)ptr;
+	size_t num_fields = type->num_fields;
+	ebi_field *begin = type->fields, *end = begin + num_fields;
+
+	if (type->flags & EBI_TYPE_HAS_SUFFIX) {
+		ebi_field *suffix = --end;
+		ebi_mark_slots_many(et, inst_ptr + type->data_size,
+			suffix->type, *(size_t*)inst_ptr);
+	}
+
+	for (ebi_field *f = begin; f != end; f++) {
+		if (f->flags & EBI_FIELD_IS_REF) {
+			ebi_mark(et, *(void**)(inst_ptr + f->offset));
+		} else if (f->flags & EBI_TYPE_HAS_REFS) {
+			ebi_mark_slots(et, inst_ptr + f->offset, f->type);
+		}
 	}
 }
 
@@ -345,41 +376,7 @@ void ebi_mark_globals(ebi_thread *et)
 
 	// Types
 	size_t num_types = sizeof(ebi_types) / sizeof(ebi_type*);
-	ebi_mark_slots(et, &vm->types, vm->types.object, num_types);
-}
-
-void *ebi_callstack_push(ebi_callstack *stack, ebi_type *type, size_t count)
-{
-	void *base = stack->top;
-	size_t size = type->size * count;
-	ebi_callframe *frame = &stack->frames[stack->num_frames++];
-	memset(base, 0, size);
-	frame->base = base;
-	frame->type = type;
-	frame->count = count;
-	stack->top = (char*)base + size;
-	return base;
-}
-
-void ebi_callstack_pop_check(ebi_callstack *stack, void *ptr)
-{
-	ebi_callframe *frame = &stack->frames[--stack->num_frames];
-	ebi_assert(ptr == frame->base);
-	stack->top = ptr;
-}
-
-void ebi_callstack_pop(ebi_callstack *stack)
-{
-	ebi_callframe *frame = &stack->frames[--stack->num_frames];
-	stack->top = frame->base;
-}
-
-void ebi_callstack_mark(ebi_thread *et, ebi_callstack *stack)
-{
-	for (uint32_t i = 0; i < stack->num_frames; i++) {
-		ebi_callframe *frame = &stack->frames[i];
-		ebi_mark_slots(et, frame->base, frame->type, frame->count);
-	}
+	ebi_mark_slots_many(et, &vm->types, vm->types.object, num_types);
 }
 
 void *ebi_alloc_heavy(size_t size)
@@ -565,6 +562,13 @@ ebi_vm *ebi_make_vm()
 
 	ebi_lock_thread(et);
 
+	ebi_type temp_info_type;
+	temp_info_type.data_size = sizeof(ebi_type_info);
+	temp_info_type.elem_size = sizeof(ebi_field_info);
+	ebi_type_info *type_info = ebi_new_array(et, &temp_info_type, 3);
+
+
+#if 0
 	// Bootstrap the type of type
 	ebi_type temp_type_type = { 0 };
 	temp_type_type.size = sizeof(ebi_type);
@@ -637,6 +641,8 @@ ebi_vm *ebi_make_vm()
 		t->slots = ebi_new_copy(et, vm->types.u32, ebi_arraycount(slots), slots);
 	}
 
+#endif
+
 	ebi_unlock_thread(et);
 
 	return vm;
@@ -676,9 +682,9 @@ ebi_types *ebi_get_types(ebi_vm *vm)
 	return &vm->types;
 }
 
-void *ebi_new(ebi_thread *et, ebi_type *type, size_t count)
+void *ebi_new(ebi_thread *et, ebi_type *type)
 {
-	size_t size = type->size * count;
+	size_t size = type->data_size;
 	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
 	if (!obj) return NULL;
 
@@ -688,16 +694,15 @@ void *ebi_new(ebi_thread *et, ebi_type *type, size_t count)
 	obj->epoch = et->epoch;
 	obj->weak_slot = 0;
 	obj->type = type;
-	obj->count = count;
 
 	ebi_add_obj(et, obj);
 
 	return data;
 }
 
-void *ebi_new_uninit(ebi_thread *et, ebi_type *type, size_t count)
+void *ebi_new_uninit(ebi_thread *et, ebi_type *type)
 {
-	size_t size = type->size * count;
+	size_t size = type->data_size;
 	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
 	if (!obj) return NULL;
 
@@ -706,46 +711,51 @@ void *ebi_new_uninit(ebi_thread *et, ebi_type *type, size_t count)
 	obj->epoch = et->epoch;
 	obj->weak_slot = 0;
 	obj->type = type;
-	obj->count = count;
 
 	ebi_add_obj(et, obj);
 
 	return data;
 }
 
-void *ebi_new_copy(ebi_thread *et, ebi_type *type, size_t count, const void *init)
+void *ebi_new_array(ebi_thread *et, ebi_type *type, size_t count)
 {
-	size_t size = type->size * count;
+	ebi_assert(type->elem_size);
+	size_t size = type->data_size + type->elem_size * count;
 	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
 	if (!obj) return NULL;
 
 	void *data = obj + 1;
-	memcpy(data, init, size);
+	memset(data, 0, size);
 
 	obj->epoch = et->epoch;
 	obj->weak_slot = 0;
 	obj->type = type;
-	obj->count = count;
+
+	*(size_t*)data = count;
 
 	ebi_add_obj(et, obj);
-	ebi_mark_slots(et, data, type, count);
 
 	return data;
 }
 
-void *ebi_push(ebi_thread *et, ebi_type *type, size_t count)
+void *ebi_new_array_uninit(ebi_thread *et, ebi_type *type, size_t count)
 {
-	return ebi_callstack_push(&et->stack, type, count);
-}
+	ebi_assert(type->elem_size);
+	size_t size = type->data_size + type->elem_size * count;
+	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
+	if (!obj) return NULL;
 
-void ebi_pop_check(ebi_thread *et, void *ptr)
-{
-	ebi_callstack_pop(&et->stack);
-}
+	void *data = obj + 1;
 
-void ebi_pop(ebi_thread *et)
-{
-	ebi_callstack_pop(&et->stack);
+	obj->epoch = et->epoch;
+	obj->weak_slot = 0;
+	obj->type = type;
+
+	*(size_t*)data = count;
+
+	ebi_add_obj(et, obj);
+
+	return data;
 }
 
 void ebi_set(ebi_thread *et, void *slot, const void *value)
@@ -764,11 +774,13 @@ void ebi_set_string(ebi_thread *et, ebi_string *dst, const ebi_string *src)
 
 ebi_type *ebi_new_type(ebi_thread *et, const ebi_type_desc *desc)
 {
-	ebi_type *type = ebi_new(et, et->vm->types.type, 1);
+#if 0
+	ebi_type *type = ebi_new(et, et->vm->types.type);
 	type->size = desc->size;
 	ebi_set_string(et, &type->name, &desc->name);
 	ebi_set(et, &type->slots, desc->slots);
 	return type;
+#endif
 }
 
 ebi_string ebi_new_string(ebi_thread *et, const char *data, size_t length)
@@ -943,7 +955,7 @@ ebi_ptr void *ebi_resolve_weak_ref(ebi_thread *et, ebi_weak_ref ref)
 	return ptr;
 }
 
-ebi_symbol ebi_intern(ebi_thread *et, const char *data, size_t length)
+ebi_symbol *ebi_intern(ebi_thread *et, const char *data, size_t length)
 {
 	ebi_vm *vm = et->vm;
 	uint32_t hash = ebi_intern_hash(data, length);
@@ -961,7 +973,7 @@ ebi_symbol ebi_intern(ebi_thread *et, const char *data, size_t length)
 
 	ebi_intern_slot displaced = { 0 };
 
-	void *result = NULL;
+	ebi_symbol *sym = NULL;
 	for (;;) {
 		ebi_intern_slot *ns = &slots[ix];
 		uint32_t nscan = (ix - ns->hash) & mask;
@@ -969,20 +981,23 @@ ebi_symbol ebi_intern(ebi_thread *et, const char *data, size_t length)
 			displaced = *ns;
 			scan = nscan;
 
-			char *copy = ebi_new_copy(et, vm->types.char_, length, data);
-			uint64_t weak = ebi_make_weak_ref_no_mutex(et, copy);
+			ebi_symbol *sym = ebi_new_array_uninit(et, vm->types.symbol, length, data);
+
+			memcpy(sym->data, data, length);
+			sym->length = length;
+
+			uint64_t weak = ebi_make_weak_ref_no_mutex(et, sym);
 
 			ns->hash = hash;
 			ns->weak_ix = (uint32_t)(weak >> 32);
 			ns->weak_gen = (uint32_t)weak;
 
-			result = copy;
 			break;
 		} else if (ns->hash == hash) {
 			uint64_t ref = (uint64_t)ns->weak_ix << 32 | (uint64_t)ns->weak_gen;
 			void *obj = ebi_resolve_weak_ref_no_mutex(et, ref);
 			if (obj && ebi_obj_count(obj) == length && !memcmp(obj, data, length)) {
-				result = obj;
+				sym = (ebi_symbol*)obj;
 				break;
 			}
 		}
@@ -1004,11 +1019,10 @@ ebi_symbol ebi_intern(ebi_thread *et, const char *data, size_t length)
 
 	ebi_mutex_unlock(&vm->weak_mutex);
 
-	ebi_symbol sym = { result };
 	return sym;
 }
 
-ebi_symbol ebi_internz(ebi_thread *et, const char *data)
+ebi_symbol *ebi_internz(ebi_thread *et, const char *data)
 {
 	return ebi_intern(et, data, strlen(data));
 }

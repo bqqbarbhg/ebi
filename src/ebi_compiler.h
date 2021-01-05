@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ebi_core.h"
+#include "ebi_vm.h"
 
 typedef struct ebi_token ebi_token;
 typedef struct ebi_ast ebi_ast;
@@ -101,3 +102,4 @@ ebi_ast *ebi_parse(ebi_thread *et, const char *source, size_t length);
 
 void ebi_dump_ast(ebi_ast *ast, int ident);
 
+void ebi_compile(ebi_ast **asts, size_t num_asts);

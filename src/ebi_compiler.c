@@ -742,3 +742,8 @@ void ebi_dump_ast(ebi_ast *ast, int indent)
 		printf(")\n");
 	}
 }
+
+void ebi_compile(ebi_ast **asts, size_t num_asts)
+{
+}
+

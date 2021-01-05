@@ -1,0 +1,140 @@
+
+trait Hash {
+    def hash(): Int { return implicitHash[This](this) }
+}
+
+def Some[T](t: T): T?
+
+@inline
+def filter[T](o: T?, fn: T => Bool): T? {
+    if (o.nonEmpty) {
+        return o
+    } else {
+        return None
+    }
+}
+
+@inline
+def map[T, U](o: T?, fn: T => U): U? {
+    if (o.has) {
+        return { has: True, value: fn(o.value)) }
+    } else {
+        return { has: False }
+    }
+}
+
+def sorted[T](a: T, b: T): (T, T) {
+    return a < b ? (a, b) : (b, a);
+}
+
+def min[T](a: T, b: T): T {
+    return sorted(a, b).0
+}
+
+class Evil[T] {
+    t: T
+    def evil[U](u: U): Tuple[T, U] {
+    }
+}
+
+class List[T] {
+    data: Array[T]
+    size: Int
+    capacity: Int
+
+    def push(t: T) {
+        if (size == capacity) grow()
+    }
+
+    def pop(): T? {
+        if (size == 0) return none()
+        let ix = size
+        size -= 1
+        return some(data[ix])
+    }
+
+    def grow() {
+        capacity = max(capacity * 2, 16)
+        newData = Array[T](capacity)
+        copy(newData, data[:size])
+    }
+
+    def '[]'(index: Int) {
+        let ix = index < 0 ? index + size : index
+        assert(index < size)
+        return data[index]
+    }
+
+    def '[]'(slice: Slice) {
+        let begin = index < 0 ? index + size : index
+        let end = index < 0 ? index + size : index
+        assert(index.end < size)
+        return data[slice]
+    }
+
+}
+
+class Range
+{
+    cur: Int
+    end: Int
+
+    def next(): Int? {
+        if (cur == end) return None
+        let val = cur
+        cur += 1
+        return Some(val)
+    }
+}
+
+class Enumerate[T]
+{
+    it: Iter[T]
+    ix: Int
+
+    def next(): Option[Tuple[Int, T]] {
+        if (v = it.next()) {
+            let i = ix
+            ix += 1
+            return Some(i)
+        } else {
+            None
+        }
+    }
+}
+
+struct Map[T, U]
+{
+    it: Iter[T]
+    fn: T => U
+
+    def next(): U? {
+        return it.next().map(fn)
+    }
+}
+
+struct Filter[T]
+{
+    it: Iter[T]
+    fn: T => Bool
+
+    def next(): T? {
+        return it.next().filter(fn)
+    }
+}
+
+def range(max: Int): Iter[Int] {
+    return Range { cur: 0, end: max }
+}
+
+def map[T, U](it: Iter[T], fn: T => U): Iter[U] {
+    return Map { it: it, fn: fn }
+}
+
+def filter[T](it: Iter[T], fn: T => Bool): Iter[T] {
+    return Filter { it: it, fn: fn }
+}
+
+def test(max: Int): Int {
+    return range(max).map(x => x * x).filter(x => x % 4 == 0)
+}
