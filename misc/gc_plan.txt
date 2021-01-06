@@ -1,0 +1,21 @@
+
+G2: unprocessed old objects (collected at end)
+G3: reachable old objects
+N3: newly allocated objects (collected at end)
+N4: newly allocated objects in the next cycle
+G3*, N4*: objects to be traversed
+
+mutator barriers:
+  Gx .. Ny  =>  Gx -> G3*   (link)
+  Xx -> G2  =>  Xx .. G3*   (unlink)
+  Xx -> N3  =>  Xx .. N4*   (unlink)
+
+collector traversal:
+  G3* -> G2  =>  G3 -> G3*
+  G3* -> Nx  =>  G3 -> G3*
+  N4* -> N3  =>  N4 -> N4*
+  N4* -> G2  =>  N4 -> G3*
+
+forbidden at the end:
+  G3 -> G2
+  G3 -> Nx
