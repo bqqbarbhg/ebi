@@ -67,7 +67,7 @@ class Object:
         if prev:
             mark_nn(epoch, prev)
         
-        if self.g ^ obj.g:
+        if bool(self.g) != bool(obj.g):
             mark_ng(epoch, obj)
         elif not obj.g:
             mark_nn(epoch, obj)
