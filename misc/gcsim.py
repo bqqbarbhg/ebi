@@ -229,7 +229,7 @@ def simulate(seed, verbose):
     if verbose:
         print(f"Seed: {seed}")
 
-    for cycle in range(1000):
+    for cycle in range(100):
         if verbose:
             print(f"==== Start {cycle} ====")
 
@@ -291,4 +291,14 @@ def simulate(seed, verbose):
 
     return True
 
-simulate(0, True)
+t = 0
+
+start = int(sys.argv[1] if len(sys.argv) > 1 else 0)
+step = int(sys.argv[2] if len(sys.argv) > 2 else 100)
+for ix in count():
+    pt, t = t, int(time.time()) // 10
+    n = start + ix * step
+    if pt != t or n < 100:
+        print(n, flush=True)
+    if not simulate(n, False):
+        break
