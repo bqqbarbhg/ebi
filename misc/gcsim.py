@@ -4,53 +4,41 @@ from itertools import count, product
 import sys
 import time
 import string
+from collections import namedtuple
+
+Epoch = namedtuple("Epoch", "g n")
 
 sim_verbose = False
 
-queue_g = []
 queue_n = []
 
-epoch_g = 3
-epoch_n = 3
-
-def mark_gg(obj):
-    if obj.g == epoch_g: return
-    if sim_verbose:
-        print(f"Mark GG {obj} ({obj.props})")
-    obj.g = epoch_g
-    queue_g.append(obj)
-
-def mark_ng(obj):
-    if obj.g == epoch_g: return
+def mark_ng(epoch, obj):
+    if obj.g == epoch.g: return
     if sim_verbose:
         print(f"Mark NG {obj} ({obj.props})")
-    obj.g = epoch_g
+    obj.g = epoch.g
     queue_n.append(obj)
 
-def mark_nn(obj):
-    if obj.g: return
-    if obj.n == epoch_n: return
+def mark_nn(epoch, obj):
+    if obj.g and obj.g != epoch.g:
+        mark_ng(epoch, obj)
+        return
+    if obj.n == epoch.n: return
     if sim_verbose:
         print(f"Mark NN {obj} ({obj.props})")
-    obj.n = epoch_n
+    obj.n = epoch.n
     queue_n.append(obj)
 
-def walk_g(obj):
-    for ref in obj.props.values():
-        mark_gg(ref)
-    if sim_verbose:
-        print(f"Walk G {obj} {obj.props}")
-
-def walk_n(obj):
+def walk_n(epoch, obj):
     if obj.g:
         for ref in obj.props.values():
-            mark_ng(ref)
+            mark_ng(epoch, ref)
         if sim_verbose:
             print(f"Walk NG {obj} {obj.props}")
     else:
         for ref in obj.props.values():
             if ref.g: continue
-            mark_nn(ref)
+            mark_nn(epoch, ref)
         if sim_verbose:
             print(f"Walk NN {obj} {obj.props}")
 
@@ -58,9 +46,9 @@ all_objs = []
 name_iter = ("".join(s) for s in product(string.ascii_uppercase, repeat=3))
 
 class Object:
-    def __init__(self, alloc_g):
-        self.g = epoch_g if alloc_g else 0
-        self.n = epoch_n
+    def __init__(self, epoch, alloc_g):
+        self.g = epoch.g if alloc_g else 0
+        self.n = epoch.n
         self.id = next(name_iter)
         self.props = { }
         all_objs.append(self)
@@ -68,7 +56,7 @@ class Object:
     def __repr__(self):
         return f"{self.id}:{self.g}:{self.n}"
 
-    def set(self, name, obj):
+    def set(self, epoch, name, obj):
         global sim_verbose
 
         prev = self.props.get(name)
@@ -79,26 +67,27 @@ class Object:
         
         if prev:
             if prev.g:
-                mark_gg(prev)
+                mark_ng(epoch, prev)
             else:
-                mark_nn(prev)
+                mark_nn(epoch, prev)
 
         if not obj.g:
             if self.g:
-                mark_ng(obj)
+                mark_ng(epoch, obj)
             else:
-                mark_nn(obj)
+                mark_nn(epoch, obj)
 
 class Thread:
     def __init__(self, name):
         self.name = name
         self.stack = []
         self.alloc_g = False
+        self.epoch = Epoch(0,0)
     
     def __repr__(self):
-        return self.name
+        return f"{self.name}:{self.epoch.g}:{self.epoch.n}"
 
-root = Object(True)
+root = Object(Epoch(0, 0), True)
 names = list("xy")
 
 def thread_sim(func):
@@ -112,17 +101,14 @@ def thread_sim(func):
         return inner
     return sim_thread
 
-def sim_gc_g():
-    if queue_g:
-        walk_g(queue_g.pop())
-
-def sim_gc_n():
+@thread_sim
+def sim_gc_n(t):
     if queue_n:
-        walk_n(queue_n.pop())
+        walk_n(t.epoch, queue_n.pop())
 
 @thread_sim
 def sim_new(t):
-    t.stack.append(Object(t.alloc_g))
+    t.stack.append(Object(t.epoch, t.alloc_g))
     if sim_verbose:
         print(f".. {t} new: {t.stack}")
 
@@ -153,7 +139,7 @@ def sim_load(t):
 def sim_store(t):
     if len(t.stack) < 2: return
     obj = t.stack.pop()
-    t.stack[-1].set(choice(names), obj)
+    t.stack[-1].set(t.epoch, choice(names), obj)
     if sim_verbose:
         print(f".. {t} store: {t.stack[-1]} {t.stack[-1].props}")
 
@@ -168,15 +154,14 @@ def sim_load_root(t):
 def sim_store_root(t):
     if not t.stack: return
     obj = t.stack.pop()
-    root.set(choice(names), obj)
+    root.set(t.epoch, choice(names), obj)
     if sim_verbose:
         print(f".. {t} store root: {root.props}")
 
 threads = [Thread(f"t{n}") for n in range(4)]
 
 sims = ([]
-    + [sim_gc_g] * 1
-    + [sim_gc_n] * 2
+    + [sim_gc_n(t) for t in threads]
     + [sim_new(t) for t in threads]
     + [sim_dup(t) for t in threads]
     + [sim_pop(t) for t in threads]
@@ -187,28 +172,23 @@ sims = ([]
     )
 
 sims_gc = (sims
-    + [sim_gc_g] * 1
-    + [sim_gc_n] * 10
+    + [sim_gc_n(t) for t in threads] * 4
 )
 
-def alive(obj, use_g):
-    if use_g:
-        return obj.g == epoch_g or (obj.g == 0 and obj.n == epoch_n)
-    else:
-        return obj.g or obj.n == epoch_n
+def alive(epoch, obj):
+    return obj.g == epoch.g or (obj.g == 0 and obj.n == epoch.n)
 
-def check(roots, use_g):
+def check(epoch, roots):
     all_set = set(all_objs)
     ok = set(roots)
     work = list(ok)
     while work:
         obj = work.pop()
-        ug = "NG"[use_g]
-        if not alive(obj, use_g):
-            print(f"Bad epoch at {ug} {epoch_g}:{epoch_n}  {roots[obj]} => {obj}")
+        if not alive(epoch, obj):
+            print(f"Bad epoch at {epoch.g}:{epoch.n}  {roots[obj]} => {obj}")
             return False
         if obj not in all_set:
-            print(f"Dead object at {ug} {epoch_g}:{epoch_n}  {roots[obj]} => {obj}")
+            print(f"Dead object at {epoch.g}:{epoch.n}  {roots[obj]} => {obj}")
             return False
         for key, prop in obj.props.items():
             if prop in ok: continue
@@ -217,21 +197,20 @@ def check(roots, use_g):
             roots[prop] = f"{roots[obj]}.{key}"
     return True
 
-def mark_stack(t):
+def mark_stack(epoch, t):
     for s in t.stack:
-        mark_nn(s)
+        mark_nn(epoch, s)
     if sim_verbose:
-        print(f".. {t} mark stack {epoch_g}:{epoch_n} => {t.stack}")
+        print(f".. {t} mark stack {epoch.g}:{epoch.n} => {t.stack}")
 
 def simulate(seed, verbose):
     global root
     global sim_verbose
     global name_iter
-    global epoch_g
-    global epoch_n
     global all_objs
 
     name_iter = ("".join(s) for s in product(string.ascii_uppercase, repeat=3))
+    epoch = Epoch(1, 1)
 
     all_objs.clear()
     random.seed(seed)
@@ -241,23 +220,25 @@ def simulate(seed, verbose):
     steps = 30
     steps_thread = 10
 
-    root = Object(True)
+    root = Object(epoch, True)
 
     for t in threads:
         t.stack.clear()
+        t.epoch = epoch
 
     if verbose:
         print(f"Seed: {seed}")
 
-    for cycle in range(100):
+    for cycle in range(1000):
         if verbose:
             print(f"==== Start {cycle} ====")
 
         for t in threads:
+            t.epoch = epoch
             t.alloc_g = False
 
         for t in threads:
-            mark_stack(t)
+            mark_stack(epoch, t)
             for n in range(steps_thread):
                 choice(sims)()
 
@@ -279,8 +260,7 @@ def simulate(seed, verbose):
                 if s in roots: continue
                 roots[s] = f"{t}[{i}]"
 
-        use_g = not queue_g and cycle % 2 == 0
-        all_objs = [o for o in all_objs if alive(o, use_g)]
+        all_objs = [o for o in all_objs if alive(epoch, o)]
 
         if verbose:
             print(f"==== Roots at {cycle} ====")
@@ -291,22 +271,23 @@ def simulate(seed, verbose):
             for obj in all_objs:
                 print(f"{obj} => {obj.props}")
 
-        if not check(roots, use_g):
+        if not check(epoch, roots):
             if verbose: return False
             return simulate(seed, True)
 
-        epoch_n += 1
+        epoch = Epoch(epoch.g, epoch.n + 1)
         if verbose:
-            print(f"GC: N at {epoch_g}:{epoch_n}")
+            print(f"GC: N at {epoch.g}:{epoch.n}")
 
-        if use_g:
-            epoch_g += 1
+        if cycle % 10 == 0:
+            epoch = Epoch(epoch.g + 1, epoch.n)
             if verbose:
-                print(f"GC: G at {epoch_g}:{epoch_n}")
-            mark_gg(root)
+                print(f"GC: G at {epoch.g}:{epoch.n}")
+
+            mark_ng(epoch, root)
             for t in threads:
                 for s in t.stack:
-                    mark_ng(s)
+                    mark_ng(epoch, s)
 
     return True
 
