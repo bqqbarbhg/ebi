@@ -191,6 +191,9 @@ def check(epoch, roots):
             print(f"Dead object at {epoch.g}:{epoch.n}  {roots[obj]} => {obj}")
             return False
         for key, prop in obj.props.items():
+            if obj.g and not prop.g:
+                print(f"G to N link {epoch.g}:{epoch.n}  {obj}[{key}] => {prop}")
+                return False
             if prop in ok: continue
             ok.add(prop)
             work.append(prop)
