@@ -10,13 +10,13 @@ queue_n = []
 
 def mark_g(obj):
     if sim_verbose:
-        print(f"Mark {obj} => G3")
+        print(f"Mark {obj} => G3 ({obj.props})")
     obj.gen = "G3"
     queue_g.append(obj)
 
 def mark_n(obj):
     if sim_verbose:
-        print(f"Mark {obj} => N4")
+        print(f"Mark {obj} => N4 ({obj.props})")
     obj.gen = "N4"
     queue_n.append(obj)
 
@@ -63,8 +63,8 @@ class Object:
 
         if self.gen[0] == "G" and obj.gen[0] == "N":
             mark_g(obj)
-        # elif obj.gen == "N3" and scanning_stacks:
-            # mark_n(obj)
+        elif self.gen == "N4" and obj.gen == "N3":
+            mark_n(obj)
 
         if prev and prev.gen == "G2":
             mark_g(prev)
@@ -219,22 +219,22 @@ def simulate(seed, verbose):
         roots += t.stack
 
     if verbose:
+        for t in threads:
+            print(t.stack)
+        for obj in all_objs:
+            print(f"{obj} => {obj.props}")
         assert not check_retain(roots)
         return True
 
     if not check_retain(roots):
         print(f"Fail at attempt {seed}")
 
-        for t in threads:
-            print(t.stack)
-        for obj in all_objs:
-            print(f"{obj} => {obj.props}")
-
         return simulate(seed, True)
     return False
 
 start = int(sys.argv[1] if len(sys.argv) > 1 else 0)
-for n in count(start=start, step=100):
+step = int(sys.argv[2] if len(sys.argv) > 2 else 100)
+for n in count(start=start, step=step):
     if (n//100) % 10000 == 0:
         print(".", end="", flush=True)
     if simulate(n, False):
