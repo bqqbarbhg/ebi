@@ -94,8 +94,8 @@ def thread_sim(func):
     def sim_thread(t):
         def inner():
             func(t)
-            if len(t.stack) > 10:
-                t.stack = t.stack[-10:]
+            if len(t.stack) > 20:
+                t.stack = t.stack[-20:]
                 if sim_verbose:
                     print(f".. {t} truncate: {t.stack}")
         return inner
