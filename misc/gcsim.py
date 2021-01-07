@@ -2,6 +2,7 @@ from random import choice
 import random
 from itertools import count
 import sys
+import time
 
 sim_verbose = False
 
@@ -166,6 +167,9 @@ def check_retain(work):
             return False
         obj.ok = True
         for prop in obj.props.values():
+            if obj.gen == "G3" and prop.gen != "G3":
+                print(f"FAIL {obj} -> {prop}!")
+                return False
             work.append(prop)
     return True
 
@@ -232,10 +236,14 @@ def simulate(seed, verbose):
         return simulate(seed, True)
     return False
 
+t = 0
+
 start = int(sys.argv[1] if len(sys.argv) > 1 else 0)
 step = int(sys.argv[2] if len(sys.argv) > 2 else 100)
-for n in count(start=start, step=step):
-    if (n//100) % 10000 == 0:
-        print(".", end="", flush=True)
+for ix in count():
+    pt, t = t, int(time.time()) // 10
+    n = start + ix * step
+    if pt != t:
+        print(n, flush=True)
     if simulate(n, False):
         break
