@@ -14,19 +14,19 @@ queue_n = []
 
 def mark_ng(epoch, obj):
     if obj.g == epoch.g: return
+    obj.g = epoch.g
     if sim_verbose:
         print(f"Mark NG {obj} ({obj.props})")
-    obj.g = epoch.g
     queue_n.append(obj)
 
 def mark_nn(epoch, obj):
-    if obj.g and obj.g != epoch.g:
+    if obj.g:
         mark_ng(epoch, obj)
         return
     if obj.n == epoch.n: return
+    obj.n = epoch.n
     if sim_verbose:
         print(f"Mark NN {obj} ({obj.props})")
-    obj.n = epoch.n
     queue_n.append(obj)
 
 def walk_n(epoch, obj):
@@ -37,7 +37,6 @@ def walk_n(epoch, obj):
             print(f"Walk NG {obj} {obj.props}")
     else:
         for ref in obj.props.values():
-            if ref.g: continue
             mark_nn(epoch, ref)
         if sim_verbose:
             print(f"Walk NN {obj} {obj.props}")
@@ -66,16 +65,12 @@ class Object:
             print(f"{self}.{name} = {obj} ({prev})")
         
         if prev:
-            if prev.g:
-                mark_ng(epoch, prev)
-            else:
-                mark_nn(epoch, prev)
-
-        if not obj.g:
-            if self.g:
-                mark_ng(epoch, obj)
-            else:
-                mark_nn(epoch, obj)
+            mark_nn(epoch, prev)
+        
+        if self.g ^ obj.g:
+            mark_ng(epoch, obj)
+        elif not obj.g:
+            mark_nn(epoch, obj)
 
 class Thread:
     def __init__(self, name):
