@@ -858,12 +858,14 @@ bool ebi_gc_sweep(ebi_thread *et)
 			ebi_add_obj(et, obj);
 		} else {
 			if (obj->weak_slot) {
-				// TODO: Batch these
+				// TODO: Batch these?
 				ebi_mutex_lock(&vm->weak_mutex);
 				ebi_weak_slot *slot = &vm->weak_slots[obj->weak_slot];
-				slot->val.next_free = vm->weak_free_head;
-				vm->weak_free_head = obj->weak_slot;
-				slot->gen++;
+				if (slot->gen != UINT32_MAX) {
+					slot->val.next_free = vm->weak_free_head;
+					vm->weak_free_head = obj->weak_slot;
+					slot->gen++;
+				}
 				ebi_mutex_unlock(&vm->weak_mutex);
 			}
 
