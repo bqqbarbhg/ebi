@@ -12,6 +12,8 @@
 
 #define ebi_forceinline __forceinline
 
+#define EBI_DEBUG 1
+
 typedef struct ebi_vm ebi_vm;
 typedef struct ebi_thread ebi_thread;
 typedef struct ebi_type_info ebi_type_info;
@@ -103,7 +105,7 @@ void *ebi_new_uninit(ebi_thread *et, ebi_type *type);
 void *ebi_new_array(ebi_thread *et, ebi_type *type, size_t count);
 void *ebi_new_array_uninit(ebi_thread *et, ebi_type *type, size_t count);
 
-void ebi_set(ebi_thread *et, void *slot, const void *value);
+void ebi_set(ebi_thread *et, void *inst, size_t offset, void *value);
 void ebi_set_string(ebi_thread *et, ebi_string *dst, const ebi_string *src);
 
 ebi_type *ebi_new_type(ebi_thread *et, const ebi_type_desc *desc);

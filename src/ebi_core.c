@@ -63,6 +63,11 @@ void *ebi_ia_pop(ebi_ia_stack *s)
 	return head;
 }
 
+bool ebi_ia_maybe_nonempty(ebi_ia_stack *s)
+{
+	return s->v[0] != 0;
+}
+
 void *ebi_ia_pop_all(ebi_ia_stack *s)
 {
 	ebi_ia_stack r = *s;
@@ -91,11 +96,14 @@ typedef struct ebi_mutex {
 void ebi_mutex_lock(ebi_mutex *m)
 {
 	uint32_t cmp = 1;
+	uint32_t spin = 0;
 	for (;;) {
 		if (!_interlockedbittestandset((volatile long*)&m->lock, 0)) break;
-		_InterlockedIncrement((volatile long*)&m->waiters);
-		WaitOnAddress(&m->lock, &cmp, 4, INFINITE);
-		_InterlockedDecrement((volatile long*)&m->waiters);
+		if (++spin > 1000) {
+			_InterlockedIncrement((volatile long*)&m->waiters);
+			WaitOnAddress(&m->lock, &cmp, 4, INFINITE);
+			_InterlockedDecrement((volatile long*)&m->waiters);
+		}
 	}
 }
 
@@ -112,6 +120,37 @@ void ebi_mutex_unlock(ebi_mutex *m)
 	}
 }
 
+// Event
+
+// TODO: Implement this internally
+
+typedef struct ebi_fence {
+	uint32_t lock;
+} ebi_fence;
+
+void ebi_fence_close(ebi_fence *e)
+{
+	_InterlockedExchange((volatile long*)&e->lock, 1);
+}
+
+void ebi_fence_open(ebi_fence *e)
+{
+	_InterlockedExchange((volatile long*)&e->lock, 0);
+	WakeByAddressAll(&e->lock);
+}
+
+void ebi_fence_wait(ebi_fence *e)
+{
+	uint32_t cmp = 0;
+	uint32_t spin = 0;
+	for (;;) {
+		if (_InterlockedExchangeAdd((volatile long*)&e->lock, 0) == 0) break;
+		if (++spin > 1000) {
+			WaitOnAddress(&e->lock, &cmp, 4, INFINITE);
+		}
+	}
+}
+
 // Utility
 
 static ebi_forceinline size_t ebi_grow_sz(size_t size, size_t min)
@@ -121,11 +160,546 @@ static ebi_forceinline size_t ebi_grow_sz(size_t size, size_t min)
 
 // -- Core
 
+#define EBI_OBJLIST_SIZE 64
+#define EBI_MAX_DEFER_LINKS 64
+
 typedef struct ebi_obj ebi_obj;
+typedef struct ebi_gc_gen ebi_gc_gen;
+typedef struct ebi_pool ebi_pool;
+typedef struct ebi_objlist ebi_objlist;
+typedef struct ebi_objlink ebi_objlink;
+
+// Shared allocation for small similarly-sized objects
+struct ebi_pool {
+
+	// Pointer to the next entry in an intrusive atomic `ebi_ia_list`
+	ebi_pool *next;
+
+	// Bit-mask of allocated slots in the pool
+	uint32_t alloc_mask[4];
+};
+
+// Generation counters for garbage collection. We mark objects with a number
+// instead of a mark bit so instead of clearing the marks we can increase the
+// reference value `vm->gen`. In addition we have two sets: G and N. Objects in
+// G are only traversed/collected during major collcetions while N are always.
+//
+// Pointers from G to N are not allowed at the end of the mark phase, this is
+// enfored by promoting N objects (recursively) to G when pointed to from G.
+//
+// We use two separate byte-sized variables so we can assign to them without
+// atomic operations. This is safe since even though we _do_ have race
+// conditions, all threads try to write the same values: `vm->gen.g/n`.
+// If `gen.g != 0` then `gen.n` is ignored!
+struct ebi_gc_gen {
+	uint8_t g, n;
+};
+
+// Heap object header
+struct ebi_obj {
+	ebi_type *type;
+	uint32_t weak_slot;
+	uint16_t pool_offset;
+	ebi_gc_gen gen;
+	char data[];
+};
+
+// List of objects that can be sent between threads
+struct ebi_objlist {
+
+	// Intrusive atomic `ebi_ia_list` link
+	ebi_objlist *next;
+
+	ebi_obj *objs[EBI_OBJLIST_SIZE];
+	uint32_t count;
+};
+
+// Link between two heap objects, for example `src.prop = dst`.
+struct ebi_objlink {
+	void *src, *dst;
+};
+
+typedef enum ebi_alive_group {
+	EBI_ALIVE_G,  // G objects, swept on major GC
+	EBI_ALIVE_N1, // old N objects, swept on minor GC
+	EBI_ALIVE_N2, // new N objects, not swept
+
+	EBI_NUM_ALIVE_GROUPS,
+} ebi_alive_group;
+
+typedef enum ebi_gc_stage {
+	EBI_GC_IDLE,
+	EBI_GC_MARK,
+	EBI_GC_SWEEP,
+} ebi_gc_stage;
+
+struct ebi_thread {
+	ebi_vm *vm;
+
+	// Monotonically increased value, the thread will synchronize with others
+	// at `ebi_checkpoint()` if `et->checkpoint != vm->checkpoint`.
+	// If `checkpoint_fence` is set all threads will stop and wait.
+	uint32_t checkpoint;
+
+	// Current GC generation, a local copy of `vm->gen`.
+	ebi_gc_gen gen;
+
+	// Mutex used to take ownership of this thread. Used eg. for scanning
+	// stacks of halted threads.
+	ebi_mutex mutex;
+	bool lock_by_gc;
+
+	ebi_objlist *objs_mark; // List of marked objects to traverse
+	ebi_objlist *objs_alive[EBI_NUM_ALIVE_GROUPS]; // Alive objects per group
+
+	// Deferred batched object to object links to process.
+	ebi_objlink defer_links[EBI_MAX_DEFER_LINKS];
+	size_t num_defer_links;
+};
+
+struct ebi_vm {
+	// Hot data
+	uint32_t checkpoint;
+	bool checkpoint_fence;
+	ebi_gc_gen gen;
+	uint8_t pad[9];
+
+	// Object lists
+	ebi_ia_stack objs_mark;
+	ebi_ia_stack objs_sweep;
+	ebi_ia_stack objs_sweep_next;
+	ebi_ia_stack objs_alive[EBI_NUM_ALIVE_GROUPS];
+	ebi_ia_stack objs_reuse;
+
+	// Threads
+	ebi_mutex thread_mutex;
+	ebi_fence thread_fence;
+	ebi_fence thread_sync_fence;
+	ebi_thread **threads;
+	size_t num_threads;
+	size_t max_threads;
+
+	// GC state
+	ebi_mutex gc_mutex;
+	ebi_gc_stage gc_stage;
+	bool gc_major;
+};
+
+
+#if EBI_DEBUG
+ebi_forceinline ebi_obj *ebi_get_obj(void *inst)
+{
+	ebi_assert(inst);
+	ebi_obj *obj = (ebi_obj*)inst - 1;
+	ebi_assert(obj->type);
+	return obj;
+}
+#else
+	#define ebi_get_obj(inst) ((ebi_obj*)(inst) - 1)
+#endif
+
+// Allocate a new empty object list.
+ebi_objlist *ebi_alloc_objlist(ebi_vm *vm)
+{
+	ebi_objlist *list = ebi_ia_pop(&vm->objs_reuse);
+	if (!list) {
+		list = (ebi_objlist*)malloc(sizeof(ebi_objlist));
+		ebi_assert(list);
+		list->next = NULL;
+	}
+	list->count = 0;
+	return list;
+}
+
+// Send the current to-mark list to GC threads to process
+ebi_objlist *ebi_flush_marks(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+	if (et->objs_mark->count > 0) {
+		ebi_ia_push(&vm->objs_mark, et->objs_mark);
+		et->objs_mark = ebi_alloc_objlist(vm);
+	}
+	return et->objs_mark;
+}
+
+ebi_objlist *ebi_flush_alive(ebi_thread *et, ebi_alive_group group)
+{
+	ebi_vm *vm = et->vm;
+	if (et->objs_alive[group]->count > 0) {
+		ebi_ia_push(&vm->objs_alive[group], et->objs_alive[group]);
+		et->objs_alive[group] = ebi_alloc_objlist(vm);
+	}
+	return et->objs_alive[group];
+}
+
+// If the object type has references push it to the to-mark list.
+ebi_forceinline void ebi_queue_mark(ebi_thread *et, ebi_obj *obj)
+{
+	if (obj->type->flags & EBI_TYPE_HAS_REFS) {
+		ebi_objlist *list = et->objs_mark;
+		if (list->count == EBI_OBJLIST_SIZE) {
+			list = ebi_flush_marks(et);
+		}
+		list->objs[list->count++] = obj;
+	}
+}
+
+// Mark `ptr`, promote the object to G if `to_g == true`.
+ebi_forceinline void ebi_mark(ebi_thread *et, void *ptr, bool to_g)
+{
+	ebi_obj *obj = ebi_get_obj(ptr);
+
+	// Update the active generation
+	if (obj->gen.g | to_g) {
+		if (obj->gen.g == et->gen.g) return;
+		obj->gen.g = et->gen.g;
+	} else {
+		if (obj->gen.n == et->gen.n) return;
+		obj->gen.n = et->gen.n;
+	}
+	ebi_queue_mark(et, obj);
+}
+
+ebi_forceinline void ebi_add_alive(ebi_thread *et, ebi_obj *obj, ebi_alive_group group)
+{
+	ebi_objlist *list = et->objs_alive[group];
+	if (list->count == EBI_OBJLIST_SIZE) {
+		list = ebi_flush_alive(et, group);
+	}
+	list->objs[list->count++] = obj;
+}
+
+void ebi_mark_fields(ebi_thread *et, void *ptr, ebi_type *type, bool to_g);
+
+// Mark a complex object of `type` located at `ptr`.
+ebi_forceinline void ebi_mark_type(ebi_thread *et, void *ptr, ebi_type *type, bool to_g)
+{
+	uint32_t flags = type->flags;
+	if (flags & EBI_TYPE_IS_REF) {
+		void *value = *(void**)ptr;
+		if (value) {
+			ebi_mark(et, value, to_g);
+		}
+	} else if (flags & EBI_TYPE_HAS_REFS) {
+		ebi_mark_fields(et, ptr, type, to_g);
+	}
+}
+
+// Mark fields of a `type` at `ptr`.
+void ebi_mark_fields(ebi_thread *et, void *ptr, ebi_type *type, bool to_g)
+{
+	ebi_assert(type->flags & EBI_TYPE_HAS_REFS);
+
+	char *inst_ptr = (char*)ptr;
+	size_t num_fields = type->num_fields;
+
+	ebi_field *begin = type->fields, *end = begin + num_fields;
+	for (ebi_field *f = begin; f != end; f++) {
+		ebi_mark_type(et, inst_ptr + f->offset, f->type, to_g);
+	}
+
+	if (type->flags & EBI_TYPE_HAS_SUFFIX) {
+		ebi_type *suf_type = end->type;
+		size_t suf_stride = suf_type->data_size, suf_num = *(uint32_t*)inst_ptr;
+		char *suf_ptr = inst_ptr + type->data_size;
+
+		// Optimized suffix marking as arrays tend to be larger than structs
+		// TODO: Optimization for `EBI_TYPE_HAS_ONE_REF` ?
+		if (suf_type->flags & EBI_TYPE_IS_REF) {
+			while (suf_num > 0) {
+				void *value = *(void**)suf_ptr;
+				if (value) {
+					ebi_mark(et, value, to_g);
+				}
+				suf_num--;
+				suf_ptr += suf_stride;
+			}
+		} else if (suf_type->flags & EBI_TYPE_HAS_REFS) {
+			while (suf_num > 0) {
+				ebi_mark_fields(et, suf_ptr, suf_type, to_g);
+				suf_num--;
+				suf_ptr += suf_stride;
+			}
+		}
+	}
+}
+
+// Flush deferred object links
+void ebi_flush_links(ebi_thread *et)
+{
+	size_t num = et->num_defer_links;
+	if (!num) return;
+
+	// TODO: Memory barrier here
+
+	for (size_t i = 0; i < num; i++) {
+		ebi_objlink link = et->defer_links[i];
+		uint32_t src_g = ebi_get_obj(link.src)->gen.g;
+		uint32_t dst_g = ebi_get_obj(link.dst)->gen.g;
+
+		// Promote `dst` to G for `N->G` and `G->N` links. Note that this will
+		// also "promote" `dst` if both are in G with different genrations.
+		ebi_mark(et, link.dst, (src_g ^ dst_g) != 0);
+	}
+}
+
+// Defer an object link mark
+ebi_forceinline void ebi_defer_link(ebi_thread *et, void *src, void *dst)
+{
+	if (et->num_defer_links == EBI_MAX_DEFER_LINKS) {
+		ebi_flush_links(et);
+	}
+	ebi_objlink *link = &et->defer_links[et->num_defer_links++];
+	link->src = src;
+	link->dst = dst;
+}
+
+// Assign reference at `inst + offset` to `value`. Issue write barriers to
+// not hide references from the GC threads.
+void ebi_assign_ref(ebi_thread *et, void *inst, size_t offset, void *value)
+{
+	void **slot = (void**)((char*)inst + offset);
+
+	// Always issue an Yuasa deletion barrier for the previous value
+	void *prev = *slot;
+	if (prev) {
+		ebi_mark(et, prev, false);
+	}
+
+	// Defer other barriers to reduce the amount of memory fences
+	ebi_defer_link(et, inst, value);
+
+	*slot = (void*)value;
+}
+
+// Advance the mark phase of GC.
+// Returns `true` if there was something to mark.
+bool ebi_gc_mark(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+	ebi_objlist *list = ebi_ia_pop(&vm->objs_mark);
+	if (!list) return false;
+
+	// Objects only end up in this list if `EBI_TYPE_HAS_REFS` so we can safely
+	// call `ebi_mark_fields()` directly wihtout a check.
+	uint32_t count = list->count;
+	for (uint32_t oi = 0; oi < count; oi++) {
+		ebi_obj *obj = list->objs[oi];
+		ebi_mark_fields(et, obj->data, obj->type, obj->gen.g != 0);
+	}
+
+	ebi_ia_push(&vm->objs_reuse, list);
+	return true;
+}
+
+ebi_forceinline bool ebi_alive(ebi_gc_gen cur, ebi_gc_gen gen)
+{
+	uint32_t dg = ((uint32_t)gen.g - (uint32_t)cur.g) & 0xff;
+	uint32_t dn = ((uint32_t)gen.n - (uint32_t)cur.n) & 0xff;
+	return (dg < 128) | ((gen.g == 0) & (dn < 128));
+}
+
+void ebi_free_obj(ebi_thread *et, ebi_obj *obj)
+{
+#if 0
+	if (obj->weak_slot) {
+		// TODO: Batch these?
+		ebi_mutex_lock(&vm->weak_mutex);
+		ebi_weak_slot *slot = &vm->weak_slots[obj->weak_slot];
+		if (slot->gen != UINT32_MAX) {
+			slot->val.next_free = vm->weak_free_head;
+			vm->weak_free_head = obj->weak_slot;
+			slot->gen++;
+		}
+		ebi_mutex_unlock(&vm->weak_mutex);
+	}
+#endif
+
+	free(obj);
+}
+
+// Advance the sweep phase of GC.
+// Returns `true` if there was something to sweep.
+bool ebi_gc_sweep(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+	ebi_objlist *list = ebi_ia_pop(&vm->objs_sweep);
+	if (!list) {
+		if (ebi_ia_maybe_nonempty(&vm->objs_sweep_next)) {
+			list = ebi_ia_pop_all(&vm->objs_sweep_next);
+			if (list) {
+				ebi_ia_push_all(&vm->objs_sweep, list);
+				if (list->next) {
+					ebi_ia_push_all(&vm->objs_sweep_next, list->next);
+				}
+			}
+		}
+		if (!list) return false;
+	}
+
+	ebi_gc_gen gen = et->gen;
+
+	uint32_t count = list->count;
+	for (uint32_t oi = 0; oi < count; oi++) {
+		ebi_obj *obj = list->objs[oi];
+		if (ebi_alive(gen, obj->gen)) {
+			ebi_add_alive(et, obj, obj->gen.g ? EBI_ALIVE_G : EBI_ALIVE_N1);
+		} else {
+			ebi_free_obj(et, obj);
+		}
+	}
+
+	ebi_ia_push(&vm->objs_reuse, list);
+	return true;
+}
+
+ebi_obj *ebi_alloc_obj(ebi_thread *et, ebi_type *type, size_t size)
+{
+	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
+	if (!obj) return NULL;
+
+	obj->type = type;
+	obj->weak_slot = 0;
+	obj->pool_offset = 0;
+	obj->gen.g = 0;
+	obj->gen.n = et->gen.n;
+	ebi_add_alive(et, obj, EBI_ALIVE_N2);
+
+	return obj;
+}
+
+void *ebi_new(ebi_thread *et, ebi_type *type)
+{
+	size_t size = type->data_size;
+	ebi_obj *obj = ebi_alloc_obj(et, type, size);
+	if (!obj) return NULL;
+
+	void *data = obj + 1;
+	memset(data, 0, size);
+	return data;
+}
+
+void ebi_synchronize_thread(ebi_thread *et, bool wait_marks)
+{
+	ebi_vm *vm = et->vm;
+	if (et->checkpoint == vm->checkpoint) return;
+
+	for (uint32_t i = 0; i < EBI_NUM_ALIVE_GROUPS; i++) {
+		ebi_flush_alive(et, (ebi_alive_group)i);
+	}
+
+	do {
+		ebi_flush_links(et);
+		ebi_flush_marks(et);
+	} while (wait_marks && ebi_gc_mark(et));
+
+	et->gen = vm->gen;
+	et->checkpoint = vm->checkpoint;
+}
+
+void ebi_synchronize_thread_fence(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+
+	if (vm->checkpoint_fence) {
+		ebi_synchronize_thread(et, true);
+		ebi_mutex_unlock(&et->mutex);
+		ebi_fence_wait(&vm->thread_fence);
+		ebi_mutex_lock(&et->mutex);
+	} else {
+		ebi_synchronize_thread(et, false);
+	}
+}
+
+void ebi_checkpoint(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+	if (et->checkpoint != vm->checkpoint) {
+		ebi_synchronize_thread_fence(et);
+	}
+}
+
+
+void ebi_gc_thread_barrier(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+
+	ebi_mutex_lock(&vm->thread_mutex);
+	ebi_fence_close(&vm->thread_fence);
+
+	vm->checkpoint_fence = true;
+	vm->gen.n = vm->gen.n == 255 ? 1 : vm->gen.n + 1;
+
+	// TODO: Atomic release
+	vm->checkpoint++;
+
+	for (uint32_t i = 0; i < vm->num_threads; i++) {
+		ebi_thread *ot = vm->threads[i];
+		ebi_mutex_lock(&ot->mutex);
+		ebi_synchronize_thread(ot, false);
+	}
+
+	for (uint32_t i = 0; i < vm->num_threads; i++) {
+		ebi_thread *ot = vm->threads[i];
+		ebi_mutex_unlock(&ot->mutex);
+	}
+
+	ebi_fence_open(&vm->thread_fence);
+	ebi_mutex_unlock(&vm->thread_mutex);
+
+	return true;
+}
+
+void ebi_mark_globals(ebi_thread *et, bool to_g)
+{
+	ebi_vm *vm = et->vm;
+
+}
+
+
+void ebi_gc_step(ebi_thread *et)
+{
+	ebi_vm *vm = et->vm;
+
+	ebi_checkpoint(et);
+
+	uintptr_t mark_count = ebi_ia_get_count(&vm->objs_mark);
+	bool mark = ebi_gc_mark(et);
+	bool sweep = ebi_gc_sweep(et);
+	if (!mark && et->objs_mark->count) {
+		ebi_flush_marks(et);
+		mark = ebi_gc_mark(et);
+	}
+
+	ebi_mutex_lock(&vm->gc_mutex);
+	switch (vm->gc_stage) {
+	case EBI_GC_IDLE:
+		ebi_mark_globals(et, vm->gc_major);
+		vm->gc_stage = EBI_GC_MARK;
+		break;
+	case EBI_GC_MARK:
+		if (!mark) {
+			ebi_thread_barrier(et);
+			vm->gc_stage = EBI_GC_SWEEP;
+			ebi_ia_push_all(&vm->objs_sweep, ebi_ia_pop_all(&vm->objs_alive[EBI_ALIVE_N1]));
+			if (vm->gc_major) {
+				ebi_ia_push_all(&vm->objs_sweep_next, ebi_ia_pop_all(&vm->objs_alive[EBI_ALIVE_G]));
+			}
+		}
+		break;
+	case EBI_GC_SWEEP:
+		vm->gc_stage = EBI_GC_IDLE;
+		break;
+	}
+	ebi_mutex_unlock(&vm->gc_mutex);
+}
+
+#if 0
 
 // Object list
 
 #define EBI_OBJLIST_SIZE 64
+#define EBI_MARKLIST_SIZE 64
 
 typedef struct ebi_objlist ebi_objlist;
 struct ebi_objlist {
@@ -134,39 +708,34 @@ struct ebi_objlist {
 	uint32_t count;
 };
 
-typedef struct ebi_callstack ebi_callstack;
-typedef struct ebi_callframe ebi_callframe;
+typedef struct ebi_deferred_mark ebi_deferred_mark;
 
 struct ebi_obj {
-	uint8_t epoch;
+	ebi_type *type;
 	uint32_t weak_slot;
-	ebi_type *type;
+	uint16_t block_offset;
+	uint8_t epoch_g;
+	uint8_t epoch_n;
 };
 
-struct ebi_callframe {
-	void *base;
-	ebi_type *type;
-	size_t count;
-};
-
-struct ebi_callstack {
-	void *base;
-	void *top;
-	ebi_callframe *frames;
-	uint32_t num_frames;
+struct ebi_deferred_mark {
+	void *src;
+	void *dst;
 };
 
 struct ebi_thread {
 	ebi_vm *vm;
 	uint32_t checkpoint;
 
-	uint8_t epoch;
+	uint8_t epoch_g;
+	uint8_t epoch_n;
 	ebi_mutex mutex;
 
 	ebi_objlist *objs_mark;
 	ebi_objlist *objs_alive;
 
-	ebi_callstack stack;
+	ebi_deferred_mark deferred_marks[EBI_MARKLIST_SIZE];
+	size_t num_deferred_marks;
 };
 
 typedef enum {
@@ -193,8 +762,9 @@ typedef struct {
 struct ebi_vm {
 	// Hot data
 	uint32_t checkpoint;
-	uint8_t epoch;
-	uint8_t pad[11];
+	uint8_t epoch_g;
+	uint8_t epoch_n;
+	uint8_t pad[10];
 
 	// Object lists
 	ebi_ia_stack objs_mark;
@@ -241,6 +811,24 @@ ebi_objlist *ebi_alloc_objlist(ebi_vm *vm)
 	return list;
 }
 
+static void ebi_apply_marks(ebi_thread *et)
+{
+	size_t num = et->num_deferred_marks;
+	et->num_deferred_marks = 0;
+
+	// TODO: Barrier here
+
+	for (size_t i = 0; i < num; i++) {
+		ebi_deferred_mark *mark = &et->deferred_marks[i];
+		ebi_obj *src = (ebi_obj*)mark->src - 1, *dst = (ebi_obj*)mark->dst - 1;
+		if (src->epoch_g ^ dst->epoch_g) {
+			ebi_mark_g(et, dst + 1);
+		} else {
+			ebi_mark_n(et, dst + 1);
+		}
+	}
+}
+
 ebi_objlist *ebi_flush_marks(ebi_thread *et)
 {
 	ebi_vm *vm = et->vm;
@@ -282,12 +870,31 @@ bool ebi_thread_barrier(ebi_thread *et)
 	return true;
 }
 
-ebi_forceinline void ebi_mark(ebi_thread *et, void *ptr)
+ebi_forceinline void ebi_mark_g(ebi_thread *et, void *ptr)
 {
-	if (!ptr) return;
 	ebi_obj *obj = (ebi_obj*)ptr - 1;
-	if (obj->epoch == et->epoch) return;
-	obj->epoch = et->epoch;
+	if (obj->epoch_g == et->epoch_g) return;
+	obj->epoch_g = et->epoch_g;
+
+	if (obj->type->flags & EBI_TYPE_HAS_REFS) {
+		ebi_objlist *list = et->objs_mark;
+		if (list->count == EBI_OBJLIST_SIZE) {
+			list = ebi_flush_marks(et);
+		}
+		list->objs[list->count++] = obj;
+	}
+}
+
+ebi_forceinline void ebi_mark_n(ebi_thread *et, void *ptr)
+{
+	ebi_obj *obj = (ebi_obj*)ptr - 1;
+	if (obj->epoch_g) {
+		if (obj->epoch_g == et->epoch_g) return;
+		obj->epoch_g = et->epoch_g;
+	} else {
+		if (obj->epoch_n == et->epoch_n) return;
+		obj->epoch_n = et->epoch_n;
+	}
 
 	if (obj->type->flags & EBI_TYPE_HAS_REFS) {
 		ebi_objlist *list = et->objs_mark;
@@ -435,7 +1042,7 @@ ebi_ptr void *ebi_resolve_weak_ref_no_mutex(ebi_thread *et, ebi_weak_ref ref)
 	if (slot->gen == gen) {
 		ebi_obj *obj = slot->val.obj;
 		ptr = obj + 1;
-		if (obj->epoch != et->epoch) {
+		if (obj->epoch_g != et->epoch_g) {
 			// If this object hasn't been marked by the GC in this cycle
 			// we might be in trouble: If we're sweeping it's too late
 			// to revive this reference as it will be deleted, otherwise
@@ -682,21 +1289,24 @@ ebi_types *ebi_get_types(ebi_vm *vm)
 	return &vm->types;
 }
 
+ebi_forceinline static void ebi_init_obj(ebi_thread *et, ebi_obj *obj, ebi_type *type)
+{
+	obj->epoch_n = et->epoch_n;
+	obj->epoch_g = 0;
+	obj->weak_slot = 0;
+	obj->type = type;
+	ebi_add_obj(et, obj);
+}
+
 void *ebi_new(ebi_thread *et, ebi_type *type)
 {
 	size_t size = type->data_size;
 	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
 	if (!obj) return NULL;
+	ebi_init_obj(et, obj, type);
 
 	void *data = obj + 1;
 	memset(data, 0, size);
-
-	obj->epoch = et->epoch;
-	obj->weak_slot = 0;
-	obj->type = type;
-
-	ebi_add_obj(et, obj);
-
 	return data;
 }
 
@@ -705,15 +1315,9 @@ void *ebi_new_uninit(ebi_thread *et, ebi_type *type)
 	size_t size = type->data_size;
 	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
 	if (!obj) return NULL;
+	ebi_init_obj(et, obj, type);
 
 	void *data = obj + 1;
-
-	obj->epoch = et->epoch;
-	obj->weak_slot = 0;
-	obj->type = type;
-
-	ebi_add_obj(et, obj);
-
 	return data;
 }
 
@@ -723,18 +1327,11 @@ void *ebi_new_array(ebi_thread *et, ebi_type *type, size_t count)
 	size_t size = type->data_size + type->elem_size * count;
 	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
 	if (!obj) return NULL;
+	ebi_init_obj(et, obj, type);
 
 	void *data = obj + 1;
 	memset(data, 0, size);
-
-	obj->epoch = et->epoch;
-	obj->weak_slot = 0;
-	obj->type = type;
-
 	*(size_t*)data = count;
-
-	ebi_add_obj(et, obj);
-
 	return data;
 }
 
@@ -744,25 +1341,30 @@ void *ebi_new_array_uninit(ebi_thread *et, ebi_type *type, size_t count)
 	size_t size = type->data_size + type->elem_size * count;
 	ebi_obj *obj = (ebi_obj*)malloc(sizeof(ebi_obj) + size);
 	if (!obj) return NULL;
+	ebi_init_obj(et, obj, type);
 
 	void *data = obj + 1;
-
-	obj->epoch = et->epoch;
-	obj->weak_slot = 0;
-	obj->type = type;
-
 	*(size_t*)data = count;
-
-	ebi_add_obj(et, obj);
-
 	return data;
 }
 
-void ebi_set(ebi_thread *et, void *slot, const void *value)
+void ebi_set(ebi_thread *et, void *inst, size_t offset, const void *value)
 {
-	ebi_mark(et, *(void**)slot);
-	ebi_mark(et, (void*)value);
-	*(void**)slot = (void*)value;
+	void **slot = (void**)(char*)inst + offset;
+	void *prev = *slot;
+	if (prev) ebi_mark_n(et, *slot);
+
+	if (value) {
+		if (et->num_deferred_marks == EBI_MARKLIST_SIZE) {
+			ebi_apply_marks(et);
+		}
+
+		ebi_deferred_mark *mark = &et->deferred_marks[et->num_deferred_marks++];
+		mark->src = inst;
+		mark->dst = value;
+	}
+
+	*slot = (void*)value;
 }
 
 void ebi_set_string(ebi_thread *et, ebi_string *dst, const ebi_string *src)
@@ -811,10 +1413,15 @@ void ebi_unlock_thread(ebi_thread *et)
 void ebi_synchronize_thread(ebi_thread *et)
 {
 	ebi_vm *vm = et->vm;
-	if (et->epoch != vm->epoch) {
-		et->epoch = vm->epoch;
-		ebi_callstack_mark(et, &et->stack);
+	if (et->epoch_g != vm->epoch_g) {
+		et->epoch_g = vm->epoch_g;
+		// TODO
 	}
+	if (et->epoch_n != vm->epoch_n) {
+		et->epoch_n = vm->epoch_n;
+		// TODO
+	}
+	ebi_apply_marks(et);
 	ebi_flush_marks(et);
 	ebi_flush_alive(et);
 	et->checkpoint = vm->checkpoint;
@@ -1029,3 +1636,5 @@ ebi_symbol *ebi_internz(ebi_thread *et, const char *data)
 	return ebi_intern(et, data, strlen(data));
 }
 
+
+#endif
