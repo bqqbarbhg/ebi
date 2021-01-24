@@ -15,6 +15,12 @@ static ebi_forceinline uint32_t ebi_atomic_xhg32(uint32_t *dst, uint32_t value) 
 	return (uint32_t)_InterlockedExchange((volatile long*)dst, (long)value);
 }
 
+static ebi_forceinline uint32_t ebi_bsf32(uint32_t value) {
+	unsigned long index;
+	_BitScanForward(&index, (unsigned long)value);
+	return (uint32_t)index;
+}
+
 static ebi_forceinline uint32_t ebi_atomic_dcas(uintptr_t *dst, uintptr_t *cmp, uintptr_t lo, uintptr_t hi)
 {
 #if defined(_M_X64)
